@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/pranavbhole123/distributed_kv_store/internal/store"
+	"github.com/pranavbhole123/distributed_kv_store/internal/wal"
 )
 
 // fist think of what all things we need in this
@@ -14,6 +15,7 @@ type Server struct {
 	port    int
 	store   store.Store
 	httpSrv *http.Server
+	wal   *wal.WAL
 }
 
 type SetRequest struct {
@@ -21,10 +23,11 @@ type SetRequest struct {
 	Value string `json:"value"`
 }
 
-func NewServer(port int, store store.Store) *Server {
+func NewServer(port int, store store.Store, wal *wal.WAL) *Server {
 	return &Server{
 		port:  port,
 		store: store,
+		wal: wal,
 	}
 }
 
@@ -73,6 +76,11 @@ func (s *Server) setHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// write the changes to the wal first
+	if err := s.wal.Append("SET", req.Key, req.Value); err != nil {
+		http.Error(w, "failed to write to WAL", http.StatusInternalServerError)
+		return
+	}
 
 	if err := s.store.Set(req.Key, req.Value); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -98,7 +106,10 @@ func (s *Server) deleteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing query parameter: key", http.StatusBadRequest)
 		return
 	}
-	
+	if err := s.wal.Append("DELETE", key, ""); err != nil {
+		http.Error(w, "failed to write to WAL", http.StatusInternalServerError)
+		return
+	}
 
 	if err := s.store.Delete(key); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
