@@ -1,0 +1,19 @@
+node:
+  id: 3
+  raft_addr: localhost:7003
+  http_addr: localhost:8082
+
+peers:
+  - id: 1
+    raft_addr: localhost:7001
+    http_addr: localhost:8080
+  - id: 2
+    raft_addr: localhost:7002
+    http_addr: localhost:8081
+
+data_dir: data/node-3
+
+timing:
+  election_timeout_min: 300ms
+  election_timeout_max: 600ms
+  heartbeat_interval: 50ms

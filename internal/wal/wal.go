@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,10 @@ type Entry struct {
 
 // os.open for read only
 func NewWAL(path string) (*WAL, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create WAL directory for %q: %w", path, err)
+	}
+
 	file, err := os.OpenFile(
 		path,
 		os.O_CREATE|os.O_RDWR|os.O_APPEND,
@@ -89,7 +94,7 @@ func (w *WAL) Replay() ([]Entry, error) {
 		// split the line on t create entries
 		parts := strings.SplitN(line, "\t", 4)
 
-		if len(parts) <3 {
+		if len(parts) < 3 {
 			continue
 		}
 

@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 
 	"github.com/pranavbhole123/distributed_kv_store/internal/store"
@@ -12,10 +11,10 @@ import (
 // fist think of what all things we need in this
 // we alson need the store interface in this
 type Server struct {
-	port    int
+	addr    string
 	store   store.Store
 	httpSrv *http.Server
-	wal   *wal.WAL
+	wal     *wal.WAL
 }
 
 type SetRequest struct {
@@ -23,11 +22,11 @@ type SetRequest struct {
 	Value string `json:"value"`
 }
 
-func NewServer(port int, store store.Store, wal *wal.WAL) *Server {
+func NewServer(addr string, store store.Store, wal *wal.WAL) *Server {
 	return &Server{
-		port:  port,
+		addr:  addr,
 		store: store,
-		wal: wal,
+		wal:   wal,
 	}
 }
 
@@ -132,7 +131,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/delete", s.deleteHandler)
 
 	s.httpSrv = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
+		Addr:    s.addr,
 		Handler: mux,
 	}
 
