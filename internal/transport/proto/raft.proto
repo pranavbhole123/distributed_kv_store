@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package distributedkv.raft.v1;
+
+option go_package = "github.com/pranavbhole123/distributed_kv_store/internal/transport/proto;raftpb";
+
+service RaftService {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+// Phase 3: this has no last-log fields because the replicated Raft log is
+// intentionally deferred to Phase 4.
+message RequestVoteRequest {
+  uint64 term = 1;
+  int32 candidate_id = 2;
+}
+
+message RequestVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+// Phase 3: AppendEntries is a heartbeat. Entries and commit metadata arrive in
+// Phase 4 with log replication.
+message AppendEntriesRequest {
+  uint64 term = 1;
+  int32 leader_id = 2;
+}
+
+message AppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+}

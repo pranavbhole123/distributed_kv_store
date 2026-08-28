@@ -1,0 +1,86 @@
+This is great — it's your actual KV store code, and it's a genuinely nice example of gRPC used properly in a bigger system (not just a toy). Let me explain both pieces.
+
+## What is "transport" here, conceptually?
+
+In a real distributed system, you don't want your **core logic** (the Raft consensus algorithm — leader election, voting, heartbeats) to know or care *how* bytes get from one machine to another. Today you're using gRPC. Tomorrow you might want to test two `Raft` instances talking in-memory without any network at all (fast unit tests), or swap in a different RPC framework. If your Raft code directly imported `raftpb` and called `grpc.Dial` itself, you'd be stuck — the algorithm and the network mechanism would be welded together.
+
+So "transport" is the **adapter layer** whose whole job is: *translate between "the abstract thing Raft wants to do" (call RequestVote on a peer) and "the concrete mechanism that actually moves bytes over a network" (gRPC).*
+
+That's literally what the doc comment says:
+
+> Package transport adapts Raft's Go-level RPC types to concrete network transports. Raft itself deliberately does not import this package.
+
+Notice the direction of the dependency: `transport` imports `raft` (to know its types), but `raft` never imports `transport`. Raft only knows about an interface — you can see it right there:
+
+```go
+var _ raft.Transport = (*GRPCTransport)(nil)
+```
+
+This line is a compile-time assertion: "make sure `GRPCTransport` actually implements the `raft.Transport` interface." Somewhere in your `raft` package there's presumably:
+
+```go
+type Transport interface {
+    RequestVote(ctx context.Context, peer config.Node, req RequestVoteRequest) (RequestVoteResponse, error)
+    AppendEntries(ctx context.Context, peer config.Node, req AppendEntriesRequest) (AppendEntriesResponse, error)
+}
+```
+
+Raft's core algorithm calls `transport.RequestVote(...)` on *that interface*, with no idea gRPC even exists underneath. `GRPCTransport` is just one implementation of it — the one that happens to use gRPC to actually do the work. This is the classic Go pattern: depend on interfaces, not concrete implementations, so the concrete thing is swappable.
+
+## Why two separate types for the same RPC (e.g. `raft.RequestVoteRequest` vs `raftpb.RequestVoteRequest`)?
+
+This is the key insight the second file is all about. You have **two different `RequestVoteRequest` structs**:
+- `raft.RequestVoteRequest` — Raft's own internal Go type, designed the way Raft's logic wants to think about it (e.g. `CandidateID int` — a normal Go `int`)
+- `raftpb.RequestVoteRequest` — the protobuf-generated type, shaped by wire-format constraints (e.g. `CandidateId int32` — protobuf doesn't have a generic `int`, only fixed-width ones)
+
+Why not just use the protobuf-generated struct everywhere in Raft's code and skip the conversion? Because that would leak your gRPC/protobuf choice into your core algorithm — Raft would be stuck with `int32` instead of idiomatic `int`, coupled to a specific `.proto` file, and unable to be tested or swapped without dragging protobuf along. Keeping them separate means Raft's code stays clean Go, and only the `transport` package knows protobuf exists.
+
+## What the second file actually does
+
+It's purely a **translation layer** — nothing algorithmic happens here. Every function is one of two shapes:
+
+```go
+func requestVoteToProto(request raft.RequestVoteRequest) *raftpb.RequestVoteRequest {
+	return &raftpb.RequestVoteRequest{
+		Term:        request.Term,
+		CandidateId: int32(request.CandidateID),   // int -> int32, since protobuf needs fixed width
+	}
+}
+```
+"Take Raft's internal type, repackage it as the protobuf type" — used right before sending something out over the wire (client side).
+
+```go
+func requestVoteFromProto(request *raftpb.RequestVoteRequest) raft.RequestVoteRequest {
+	return raft.RequestVoteRequest{
+		Term:        request.GetTerm(),
+		CandidateID: int(request.GetCandidateId()),
+	}
+}
+```
+The reverse — "take what arrived off the wire as protobuf, turn it back into Raft's internal type" — used right after receiving something (server side).
+
+One thing worth noticing: `request.GetTerm()` instead of `request.Term`. Generated protobuf structs always come with these `Get*()` accessor methods alongside the plain fields, and they're nil-safe — calling `.GetTerm()` on a `nil` pointer returns the zero value instead of panicking, whereas `request.Term` on a nil pointer crashes. Using the getters is generally the safer habit in gRPC code.
+
+## Now zooming out — where this fits in your two big files:
+
+- **`RaftRPCServer`** (server side) — receives raw protobuf off the wire → calls `requestVoteFromProto` to convert → calls `s.raft.HandleRequestVote(...)` with Raft's clean internal type → gets Raft's internal response back → calls `requestVoteResponseToProto` to convert it back → sends that protobuf back over the wire.
+- **`GRPCTransport`** (client side) — Raft calls `transport.RequestVote(ctx, peer, raftRequest)` with its clean internal type → `requestVoteToProto` converts it → sends over gRPC to the peer → gets protobuf response back → `requestVoteResponseFromProto` converts it back to Raft's type → hands it back to Raft.
+
+So the flow for one RequestVote call end-to-end:
+```
+Raft (candidate node) 
+  → raft.RequestVoteRequest 
+  → [toProto] → raftpb.RequestVoteRequest 
+  → gRPC over network 
+  → [fromProto] → raft.RequestVoteRequest 
+  → Raft (peer node)'s HandleRequestVote
+  → raft.RequestVoteResponse
+  → [toProto] → raftpb.RequestVoteResponse
+  → gRPC over network
+  → [fromProto] → raft.RequestVoteResponse
+  → back to the original candidate
+```
+
+The `GRPCTransport.client()` method is also worth a note: it lazily dials each peer only the first time you call it, then **caches** the connection and client in a map so subsequent heartbeats reuse the same TCP connection instead of reconnecting every single RPC — important for performance since Raft sends heartbeats constantly.
+
+Does the interface/adapter reasoning make sense — want me to show what `raft.Transport` interface likely looks like, or move on to how `AppendEntries` heartbeats actually get triggered on a timer?
