@@ -63,6 +63,9 @@ func (c Config) RaftStatePath() string {
 }
 
 func (c Config) Validate() error {
+	if c.ClusterSize() != 3 {
+		return fmt.Errorf("Phase 3 requires exactly 3 static cluster members, got %d", c.ClusterSize())
+	}
 	if c.Self.ID < 0 {
 		return errors.New("node ID must be non-negative")
 	}

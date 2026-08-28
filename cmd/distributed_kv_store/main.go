@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/pranavbhole123/distributed_kv_store/internal/config"
-	"github.com/pranavbhole123/distributed_kv_store/internal/server"
-	"github.com/pranavbhole123/distributed_kv_store/internal/store"
-	"github.com/pranavbhole123/distributed_kv_store/internal/wal"
+	"github.com/pranavbhole123/distributed_kv_store/internal/node"
 )
 
 const maxLength = 3000 // max lenght of value can be configured bys user or taken from user input from config file
@@ -22,31 +25,15 @@ func main() {
 		log.Fatalf("invalid configuration: %v", err)
 	}
 
-	//before starting replay the wal
-	wal, err := wal.NewWAL(cfg.WALPath())
-
+	n, err := node.New(cfg, maxLength)
 	if err != nil {
-		log.Fatalf("error openign wal :%v", err)
-	}
-	// now replay the entries
-	entries, err := wal.Replay()
-	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("create node: %v", err)
 	}
 
-	memStore := store.NewMemoryStore(maxLength)
-
-	for _, entry := range entries {
-		switch entry.Op {
-		case "SET":
-			memStore.Set(entry.Key, entry.Value)
-		case "DELETE":
-			memStore.Delete(entry.Key)
-		}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if err := n.Start(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("run node: %v", err)
 	}
-
-	server := server.NewServer(cfg.Self.HTTPAddr, memStore, wal)
-
-	log.Fatalf("msg: %v", server.Start())
 
 }

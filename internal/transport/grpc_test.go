@@ -14,8 +14,11 @@ import (
 
 func TestGRPCTransportDeliversRaftRPCs(t *testing.T) {
 	target, err := raft.New(config.Config{
-		Self:    config.Node{ID: 2, RaftAddr: "unused", HTTPAddr: "unused"},
-		Peers:   []config.Node{{ID: 1, RaftAddr: "unused-peer", HTTPAddr: "unused-peer"}},
+		Self: config.Node{ID: 2, RaftAddr: "unused", HTTPAddr: "unused"},
+		Peers: []config.Node{
+			{ID: 1, RaftAddr: "unused-peer-1", HTTPAddr: "unused-peer-1"},
+			{ID: 3, RaftAddr: "unused-peer-3", HTTPAddr: "unused-peer-3"},
+		},
 		DataDir: "unused",
 
 		ElectionTimeoutMin: 300 * time.Millisecond,
