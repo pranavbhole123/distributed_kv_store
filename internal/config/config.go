@@ -54,8 +54,8 @@ func (c Config) PeerByID(id int) (Node, bool) {
 	return Node{}, false
 }
 
-func (c Config) WALPath() string {
-	return filepath.Join(c.DataDir, "wal.log")
+func (c Config) RaftLogPath() string {
+	return filepath.Join(c.DataDir, "raft-log.wal")
 }
 
 func (c Config) RaftStatePath() string {

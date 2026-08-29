@@ -52,11 +52,19 @@ type Transport interface {
 	AppendEntries(context.Context, config.Node, AppendEntriesRequest) (AppendEntriesResponse, error)
 }
 
+// Applier makes committed log entries visible in a state machine. Raft only
+// controls ordering and commitment; Node supplies the KV-store implementation.
+type Applier interface {
+	Apply(LogEntry) error
+}
+
 type Raft struct {
 	id        int
 	peers     []config.Node
 	transport Transport
 	stable    StableStore
+	logStore  LogStore
+	applier   Applier
 
 	electionTimeoutMin time.Duration
 	electionTimeoutMax time.Duration
@@ -67,6 +75,9 @@ type Raft struct {
 	currentTerm uint64
 	votedFor    int
 	leaderID    int
+	log         []LogEntry
+	commitIndex uint64
+	lastApplied uint64
 
 	resetElection chan struct{}
 	cancel        context.CancelFunc
@@ -74,22 +85,43 @@ type Raft struct {
 }
 
 func New(cfg config.Config, stable StableStore, transport Transport) (*Raft, error) {
+	return NewWithLog(cfg, stable, newMemoryLogStore(), nil, transport)
+}
+
+// NewWithLog constructs Raft from its durable election state and Raft log.
+// Because the current state machine is in memory, committed entries are replayed
+// into applier at every process start. Uncommitted entries remain durable but
+// deliberately invisible.
+func NewWithLog(cfg config.Config, stable StableStore, logStore LogStore, applier Applier, transport Transport) (*Raft, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid Raft configuration: %w", err)
 	}
 	if stable == nil {
 		return nil, fmt.Errorf("Raft stable store cannot be nil")
 	}
+	if logStore == nil {
+		return nil, fmt.Errorf("Raft log store cannot be nil")
+	}
 
 	persisted, err := stable.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load Raft stable state: %w", err)
 	}
-	return &Raft{
+	entries, err := logStore.Load()
+	if err != nil {
+		return nil, fmt.Errorf("load Raft log: %w", err)
+	}
+	if persisted.CommitIndex > uint64(len(entries)) {
+		return nil, fmt.Errorf("commit index %d exceeds durable log length %d", persisted.CommitIndex, len(entries))
+	}
+
+	r := &Raft{
 		id:                 cfg.Self.ID,
 		peers:              append([]config.Node(nil), cfg.Peers...),
 		transport:          transport,
 		stable:             stable,
+		logStore:           logStore,
+		applier:            applier,
 		electionTimeoutMin: cfg.ElectionTimeoutMin,
 		electionTimeoutMax: cfg.ElectionTimeoutMax,
 		heartbeatInterval:  cfg.HeartbeatInterval,
@@ -97,8 +129,31 @@ func New(cfg config.Config, stable StableStore, transport Transport) (*Raft, err
 		currentTerm:        persisted.CurrentTerm,
 		votedFor:           persisted.VotedFor,
 		leaderID:           UnknownLeader,
+		log:                entries,
+		commitIndex:        persisted.CommitIndex,
 		resetElection:      make(chan struct{}, 1),
-	}, nil
+	}
+	if r.commitIndex > 0 && r.applier == nil {
+		return nil, fmt.Errorf("committed log requires a state-machine applier")
+	}
+	for r.lastApplied < r.commitIndex {
+		entry := r.log[r.lastApplied]
+		if err := r.applier.Apply(entry); err != nil {
+			return nil, fmt.Errorf("replay committed log entry %d: %w", entry.Index, err)
+		}
+		r.lastApplied++
+	}
+	if persisted.LastApplied != r.lastApplied {
+		if err := stable.Save(StableState{
+			CurrentTerm: r.currentTerm,
+			VotedFor:    r.votedFor,
+			CommitIndex: r.commitIndex,
+			LastApplied: r.lastApplied,
+		}); err != nil {
+			return nil, fmt.Errorf("persist recovered last applied index: %w", err)
+		}
+	}
+	return r, nil
 }
 
 func (r *Raft) Start(parent context.Context) {
@@ -147,6 +202,18 @@ func (r *Raft) LeaderID() int {
 }
 
 func (r *Raft) IsLeader() bool { return r.State() == Leader }
+
+func (r *Raft) CommitIndex() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.commitIndex
+}
+
+func (r *Raft) LastApplied() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastApplied
+}
 
 func (r *Raft) run(ctx context.Context) {
 	defer r.wg.Done()
@@ -344,7 +411,12 @@ func (r *Raft) becomeFollowerLocked(term uint64, leaderID int) error {
 }
 
 func (r *Raft) saveStableLocked(term uint64, votedFor int) error {
-	return r.stable.Save(StableState{CurrentTerm: term, VotedFor: votedFor})
+	return r.stable.Save(StableState{
+		CurrentTerm: term,
+		VotedFor:    votedFor,
+		CommitIndex: r.commitIndex,
+		LastApplied: r.lastApplied,
+	})
 }
 
 func (r *Raft) signalElectionReset() {

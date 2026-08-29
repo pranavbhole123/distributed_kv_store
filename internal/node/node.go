@@ -14,15 +14,13 @@ import (
 	"github.com/pranavbhole123/distributed_kv_store/internal/server"
 	"github.com/pranavbhole123/distributed_kv_store/internal/store"
 	"github.com/pranavbhole123/distributed_kv_store/internal/transport"
-	"github.com/pranavbhole123/distributed_kv_store/internal/wal"
 	"google.golang.org/grpc"
 )
 
 type Node struct {
 	cfg       config.Config
 	raft      *raft.Raft
-	store     store.Store
-	wal       *wal.WAL
+	logStore  raft.LogStore
 	transport *transport.GRPCTransport
 	http      *server.Server
 
@@ -36,38 +34,21 @@ func New(cfg config.Config, maxValueLength int) (*Node, error) {
 		return nil, err
 	}
 
-	w, err := wal.NewWAL(cfg.WALPath())
+	logStore, err := raft.NewFileLogStore(cfg.RaftLogPath())
 	if err != nil {
-		return nil, fmt.Errorf("open WAL: %w", err)
+		return nil, fmt.Errorf("open Raft log: %w", err)
 	}
-	closeWAL := true
+	closeLog := true
 	defer func() {
-		if closeWAL {
-			_ = w.Close()
+		if closeLog {
+			_ = logStore.Close()
 		}
 	}()
 
 	memoryStore := store.NewMemoryStore(maxValueLength)
-	entries, err := w.Replay()
-	if err != nil {
-		return nil, fmt.Errorf("replay WAL: %w", err)
-	}
-	for _, entry := range entries {
-		switch entry.Op {
-		case "SET":
-			if err := memoryStore.Set(entry.Key, entry.Value); err != nil {
-				return nil, fmt.Errorf("replay SET for key %q: %w", entry.Key, err)
-			}
-		case "DELETE":
-			// Deleting a key which is already absent is harmless during replay.
-			_ = memoryStore.Delete(entry.Key)
-		default:
-			return nil, fmt.Errorf("replay WAL: unknown operation %q", entry.Op)
-		}
-	}
 
 	grpcTransport := transport.NewGRPCTransport()
-	raftNode, err := raft.New(cfg, raft.NewFileStableStore(cfg.RaftStatePath()), grpcTransport)
+	raftNode, err := raft.NewWithLog(cfg, raft.NewFileStableStore(cfg.RaftStatePath()), logStore, storeApplier{store: memoryStore}, grpcTransport)
 	if err != nil {
 		_ = grpcTransport.Close()
 		return nil, err
@@ -76,12 +57,11 @@ func New(cfg config.Config, maxValueLength int) (*Node, error) {
 	n := &Node{
 		cfg:       cfg,
 		raft:      raftNode,
-		store:     memoryStore,
-		wal:       w,
+		logStore:  logStore,
 		transport: grpcTransport,
 	}
-	n.http = server.NewServer(cfg.Self.HTTPAddr, memoryStore, w, n)
-	closeWAL = false
+	n.http = server.NewServer(cfg.Self.HTTPAddr, memoryStore, n)
+	closeLog = false
 	return n, nil
 }
 
@@ -130,7 +110,7 @@ func (n *Node) Stop(ctx context.Context) error {
 		if err := n.transport.Close(); err != nil && stopErr == nil {
 			stopErr = err
 		}
-		if err := n.wal.Close(); err != nil && stopErr == nil {
+		if err := n.logStore.Close(); err != nil && stopErr == nil {
 			stopErr = err
 		}
 	})
@@ -160,3 +140,18 @@ func (n *Node) LeaderHTTPAddr() (string, bool) {
 // WritesReady remains false until Phase 4, when Raft replication can commit a
 // command on a majority before the HTTP handler acknowledges the client.
 func (n *Node) WritesReady() bool { return false }
+
+type storeApplier struct {
+	store store.Store
+}
+
+func (a storeApplier) Apply(entry raft.LogEntry) error {
+	switch entry.Operation {
+	case raft.SetOperation:
+		return a.store.Set(entry.Key, entry.Value)
+	case raft.DeleteOperation:
+		return a.store.Delete(entry.Key)
+	default:
+		return fmt.Errorf("apply unknown Raft operation %q", entry.Operation)
+	}
+}

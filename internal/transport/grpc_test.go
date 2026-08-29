@@ -63,3 +63,95 @@ func TestGRPCTransportDeliversRaftRPCs(t *testing.T) {
 		t.Fatalf("AppendEntries() = %+v, target leader = %d; want successful heartbeat from leader 1", heartbeat, target.LeaderID())
 	}
 }
+
+func TestTwoFreshNodesElectLeaderWithThirdPeerOffline(t *testing.T) {
+	listener1 := newTestListener(t)
+	listener2 := newTestListener(t)
+	offlineListener := newTestListener(t)
+	offlineAddress := offlineListener.Addr().String()
+	if err := offlineListener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	node1Config := threeNodeConfig(1, listener1.Addr().String(), listener2.Addr().String(), offlineAddress)
+	node2Config := threeNodeConfig(2, listener1.Addr().String(), listener2.Addr().String(), offlineAddress)
+	transport1 := NewGRPCTransport()
+	transport2 := NewGRPCTransport()
+	node1, err := raft.New(node1Config, raft.NewFileStableStore(filepath.Join(t.TempDir(), "node-1-state.json")), transport1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node2, err := raft.New(node2Config, raft.NewFileStableStore(filepath.Join(t.TempDir(), "node-2-state.json")), transport2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server1 := grpc.NewServer()
+	server2 := grpc.NewServer()
+	RegisterRaftRPCServer(server1, node1)
+	RegisterRaftRPCServer(server2, node2)
+	go func() { _ = server1.Serve(listener1) }()
+	go func() { _ = server2.Serve(listener2) }()
+	t.Cleanup(func() {
+		node1.Stop()
+		node2.Stop()
+		server1.Stop()
+		server2.Stop()
+		_ = listener1.Close()
+		_ = listener2.Close()
+		_ = transport1.Close()
+		_ = transport2.Close()
+	})
+
+	node1.Start(context.Background())
+	node2.Start(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		leaders := 0
+		for _, node := range []*raft.Raft{node1, node2} {
+			if node.IsLeader() {
+				leaders++
+			}
+		}
+		if leaders == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("two healthy nodes did not elect one leader; states are node1=%v node2=%v", node1.State(), node2.State())
+}
+
+func newTestListener(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return listener
+}
+
+func threeNodeConfig(id int, node1Address, node2Address, node3Address string) config.Config {
+	nodes := []config.Node{
+		{ID: 1, RaftAddr: node1Address, HTTPAddr: "127.0.0.1:18080"},
+		{ID: 2, RaftAddr: node2Address, HTTPAddr: "127.0.0.1:18081"},
+		{ID: 3, RaftAddr: node3Address, HTTPAddr: "127.0.0.1:18082"},
+	}
+	var self config.Node
+	peers := make([]config.Node, 0, 2)
+	for _, node := range nodes {
+		if node.ID == id {
+			self = node
+		} else {
+			peers = append(peers, node)
+		}
+	}
+	return config.Config{
+		Self:               self,
+		Peers:              peers,
+		DataDir:            "unused",
+		ElectionTimeoutMin: 100 * time.Millisecond,
+		ElectionTimeoutMax: 200 * time.Millisecond,
+		HeartbeatInterval:  25 * time.Millisecond,
+	}
+}

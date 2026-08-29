@@ -30,7 +30,7 @@ func NewGRPCTransport() *GRPCTransport {
 }
 
 func (t *GRPCTransport) RequestVote(ctx context.Context, peer config.Node, request raft.RequestVoteRequest) (raft.RequestVoteResponse, error) {
-	client, err := t.client(ctx, peer.RaftAddr)
+	client, err := t.client(peer.RaftAddr)
 	if err != nil {
 		return raft.RequestVoteResponse{}, err
 	}
@@ -42,7 +42,7 @@ func (t *GRPCTransport) RequestVote(ctx context.Context, peer config.Node, reque
 }
 
 func (t *GRPCTransport) AppendEntries(ctx context.Context, peer config.Node, request raft.AppendEntriesRequest) (raft.AppendEntriesResponse, error) {
-	client, err := t.client(ctx, peer.RaftAddr)
+	client, err := t.client(peer.RaftAddr)
 	if err != nil {
 		return raft.AppendEntriesResponse{}, err
 	}
@@ -68,21 +68,35 @@ func (t *GRPCTransport) Close() error {
 	return firstErr
 }
 
-func (t *GRPCTransport) client(ctx context.Context, address string) (raftpb.RaftServiceClient, error) {
+func (t *GRPCTransport) client(address string) (raftpb.RaftServiceClient, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if client, ok := t.clients[address]; ok {
+		t.mu.Unlock()
 		return client, nil
 	}
-	conn, err := grpc.DialContext(ctx, address,
+	t.mu.Unlock()
+
+	// NewClient creates a reusable ClientConn without waiting for a network
+	// connection. The RPC context controls each actual request's deadline, so a
+	// dead peer cannot block client creation for healthy peers.
+	conn, err := grpc.NewClient(address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("dial gRPC peer %s: %w", address, err)
+		return nil, fmt.Errorf("create gRPC client for peer %s: %w", address, err)
 	}
 	client := raftpb.NewRaftServiceClient(conn)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Another RPC may have created this peer connection while NewClient was
+	// running. Keep one shared connection and close the duplicate.
+	if existing, ok := t.clients[address]; ok {
+		if err := conn.Close(); err != nil {
+			return nil, fmt.Errorf("close duplicate gRPC connection to %s: %w", address, err)
+		}
+		return existing, nil
+	}
 	t.conns[address] = conn
 	t.clients[address] = client
 	return client, nil

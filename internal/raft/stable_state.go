@@ -13,11 +13,14 @@ import (
 
 const NoVote = -1
 
-// StableState is the small part of Raft state that must survive a crash.
-// The log belongs to Phase 4; it is deliberately not represented here yet.
+// StableState is the non-log Raft state that must survive a crash. The log is
+// stored separately because entries are appended far more often than terms or
+// commit metadata change.
 type StableState struct {
 	CurrentTerm uint64 `json:"current_term"`
 	VotedFor    int    `json:"voted_for"`
+	CommitIndex uint64 `json:"commit_index"`
+	LastApplied uint64 `json:"last_applied"`
 }
 
 // StableStore makes the Raft state machine independent of its persistence format.
@@ -63,12 +66,18 @@ func (s *FileStableStore) Load() (StableState, error) {
 	if state.VotedFor < NoVote {
 		return StableState{}, fmt.Errorf("decode Raft state %q: invalid voted_for %d", s.path, state.VotedFor)
 	}
+	if state.LastApplied > state.CommitIndex {
+		return StableState{}, fmt.Errorf("decode Raft state %q: last_applied exceeds commit_index", s.path)
+	}
 	return state, nil
 }
 
 func (s *FileStableStore) Save(state StableState) error {
 	if state.VotedFor < NoVote {
 		return fmt.Errorf("invalid voted_for %d", state.VotedFor)
+	}
+	if state.LastApplied > state.CommitIndex {
+		return fmt.Errorf("last_applied cannot exceed commit_index")
 	}
 
 	s.mu.Lock()

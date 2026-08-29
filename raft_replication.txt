@@ -1,0 +1,810 @@
+Fair — let me give you the theory first then you answer after.
+
+---
+
+## Phase 4 — Log Replication Theory
+
+---
+
+### What the log looks like
+
+Every node maintains a log — an ordered array of entries:
+
+```
+index:  1        2        3        4        5
+term:   1        1        2        2        2
+cmd:    SET a 1  SET b 2  SET c 3  DEL a    SET d 4
+```
+
+Two things identify each entry uniquely — its index and the term it was created in. Both together are needed because the same index can have different entries across nodes if a leader crashed mid-replication.
+
+---
+
+### New AppendEntries fields
+
+Phase 3 carried only Term and LeaderID. Phase 4 needs:
+
+```go
+type AppendEntriesRequest struct {
+    Term         uint64
+    LeaderID     int
+    PrevLogIndex int      // index of entry immediately before new ones
+    PrevLogTerm  uint64   // term of PrevLogIndex entry
+    Entries      []LogEntry  // empty for heartbeat
+    LeaderCommit int      // leader's current commitIndex
+}
+```
+
+**PrevLogIndex and PrevLogTerm** — the consistency check. Before appending new entries, follower verifies its log matches leader's log at this position. If it doesn't match — reject. This enforces the log matching property.
+
+**LeaderCommit** — tells followers what's safe to apply to state machine. Follower updates commitIndex to min(LeaderCommit, lastLogIndex).
+
+---
+
+### The log matching property
+
+If two logs have the same entry at the same index (same index AND same term) — then all entries before that index are identical.
+
+This is guaranteed because:
+- Leader creates at most one entry per index per term
+- AppendEntries consistency check enforces matching at prevLogIndex before appending
+
+So once a follower accepts entry at index N — everything before N is guaranteed identical to leader.
+
+---
+
+### nextIndex vs matchIndex
+
+Leader maintains two arrays — one value per follower:
+
+```
+nextIndex[i]  — optimistic guess of what to send next
+matchIndex[i] — confirmed highest index replicated on follower i
+```
+
+**nextIndex** starts optimistic — assumes follower is up to date:
+```
+nextIndex[i] = leader's lastLogIndex + 1
+```
+
+Decrements on rejection until leader finds where logs diverge.
+
+**matchIndex** starts pessimistic — assumes nothing confirmed:
+```
+matchIndex[i] = 0
+```
+
+Updates only when follower explicitly acknowledges entries.
+
+**Why both?**
+
+nextIndex drives what to send. matchIndex drives what to commit.
+
+```
+matchIndex used for commit decision:
+count nodes where matchIndex[i] >= N
+if count >= majority → commit index N
+```
+
+You can't use nextIndex for commit — it's an unconfirmed guess. matchIndex is ground truth.
+
+---
+
+### Log backtracking — finding divergence point
+
+Follower rejects AppendEntries when prevLogIndex/prevLogTerm doesn't match. Leader decrements nextIndex and retries:
+
+```
+Leader log:   [1, 2, 3, 4, 5, 6, 7]
+Follower log: [1, 2, 3]
+
+Round 1: leader sends prevLogIndex=6 → follower rejects (no entry 6)
+Round 2: leader sends prevLogIndex=5 → follower rejects (no entry 5)
+Round 3: leader sends prevLogIndex=4 → follower rejects (no entry 4)
+Round 4: leader sends prevLogIndex=3 → follower accepts (has entry 3, terms match)
+         leader sends entries 4,5,6,7 → follower appends
+```
+
+This is O(N) in the worst case — one RPC per missing entry. The Raft paper describes an optimization to skip back faster using conflicting term info. Implement basic version first, optimize later.
+
+---
+
+### Commit rule — critical detail
+
+Leader can only commit entries from its current term:
+
+```go
+// only commit if entry is from currentTerm
+if log[N].term == currentTerm && matchCount >= majority {
+    commitIndex = N
+}
+```
+
+Why? Old entries from previous terms can only be committed indirectly — by committing a new entry from the current term that comes after them. This prevents a subtle bug called the "leader completeness" violation described in the Raft paper section 5.4.
+
+---
+
+### Apply goroutine
+
+Separate goroutine continuously applies committed entries to state machine:
+
+```go
+func (r *Raft) applyCommitted() {
+    for {
+        r.mu.Lock()
+        for r.lastApplied < r.commitIndex {
+            r.lastApplied++
+            entry := r.log[r.lastApplied]
+            r.mu.Unlock()
+            r.applyEntry(entry)  // write to store
+            r.mu.Lock()
+        }
+        r.mu.Unlock()
+        time.Sleep(1 * time.Millisecond)
+    }
+}
+```
+
+Or better — use a channel to signal when commitIndex advances instead of polling.
+
+---
+
+### How write reaches client
+
+```
+Client POST /set {"key":"name","value":"pranav"}
+    ↓
+HTTP handler checks IsLeader() → true
+    ↓
+Appends to Raft log — returns index N
+    ↓
+Waits for commitIndex >= N  (blocks here)
+    ↓
+Entry applied to store
+    ↓
+Returns 200 OK to client
+```
+
+The HTTP handler must block until the entry is committed and applied. Not just appended to log. Use a per-entry channel or condition variable to signal completion.
+
+---
+
+### Follower log conflict resolution
+
+When follower receives entries that conflict with its own:
+
+```
+Follower log: [1, 2, 3, X, X]  ← X are wrong entries from old leader
+Leader sends: entries at index 4 and 5 with correct terms
+
+Follower:
+1. Verify prevLogIndex/prevLogTerm matches ✓
+2. Find first conflicting entry
+3. Truncate log from that point
+4. Append new entries
+```
+
+```go
+// find conflict
+for i, entry := range req.Entries {
+    logIdx := req.PrevLogIndex + 1 + i
+    if logIdx <= len(r.log) && r.log[logIdx-1].Term != entry.Term {
+        r.log = r.log[:logIdx-1]  // truncate
+        break
+    }
+}
+// append remaining
+r.log = append(r.log, newEntries...)
+```
+
+---
+
+Now answer the three questions from before — you have everything you need:
+
+**Q1.** Phase 3 AppendEntries carries only Term and LeaderID. What new fields does Phase 4 need and why?
+
+**Q2.** What's the difference between nextIndex and matchIndex and when does each get updated?
+
+**Q3.** A follower receives AppendEntries with prevLogIndex=5, prevLogTerm=2. Its log has index 5 but with term 3. What does it do?
+
+
+
+
+
+
+Yes, but there’s an important distinction:
+
+**`index` is the position/slot in the Raft log.**  
+**`term` tells you which leader-term created the entry occupying that slot.**
+
+So conceptually, **`(index, term)` together identify a particular version of a log entry**, but I wouldn’t think of them exactly as a database composite primary key.
+
+For example:
+
+```text
+Node A:
+index:  1   2   3   4
+term:   1   1   2   2
+cmd:    A   B   C   D
+
+Node B:
+index:  1   2   3   4
+term:   1   1   2   3
+cmd:    A   B   C   X
+```
+
+Both nodes have **index 4**, but:
+
+```text
+Node A → (index=4, term=2) → D
+Node B → (index=4, term=3) → X
+```
+
+This can temporarily happen because Node A's old leader may have written `D`, crashed before it was safely replicated, and later a leader in term 3 wrote `X` into the same logical position.
+
+That's exactly why `PrevLogIndex` alone isn't enough.
+
+Suppose the leader asks:
+
+```text
+"Do you have entry at index 4?"
+```
+
+Follower says yes — but it might have the **wrong history**.
+
+Instead the leader asks:
+
+```text
+PrevLogIndex = 4
+PrevLogTerm  = 2
+```
+
+meaning:
+
+> "Before I send you more entries, confirm that your entry at log position 4 was created in term 2."
+
+If follower has `(4,3)`, it rejects.
+
+One subtle point: **term itself is absolutely not unique.** Many entries can be created in the same term:
+
+```text
+index:  1   2   3   4   5
+term:   1   1   2   2   2
+```
+
+Likewise, **index is unique within one node's current log**, but across different nodes the same index can temporarily contain conflicting entries.
+
+So a good mental model is:
+
+```text
+index = WHERE in the log
+term  = WHICH leadership era created it
+
+(index, term) = identity used to compare log history
+```
+
+And this gives you the key Raft property from your notes:
+
+> If two Raft logs contain entries with the **same index and same term**, Raft guarantees that those entries contain the same command and that everything before them is identical.
+
+So yes: if you're coming from databases, thinking of **`(index, term)` as roughly a composite identifier** is a useful intuition. Just don't interpret it as an actual database-style primary key constraint.
+
+
+
+
+Exactly. Suppose the leader sends `AppendEntries`, and the follower **rejects it because `PrevLogIndex/PrevLogTerm` doesn't match**. The leader does **not** immediately retire. It assumes: *this follower's log is behind or divergent; I need to backtrack.*
+
+Consider:
+
+```text
+Leader log:
+index:  1  2  3  4  5  6
+term:   1  1  2  2  3  3
+
+Follower log:
+index:  1  2  3  4  5
+term:   1  1  2  4  4
+```
+
+Initially, when this leader was elected:
+
+```text
+leader lastLogIndex = 6
+
+nextIndex[follower]  = 7
+matchIndex[follower] = 0
+```
+
+`nextIndex = 7` means:
+
+> "I **guess** the follower already has entries through 6, so the next thing it needs is entry 7."
+
+`matchIndex = 0` means:
+
+> "I haven't actually confirmed anything yet."
+
+### First attempt
+
+Leader constructs:
+
+```text
+PrevLogIndex = nextIndex[follower] - 1
+             = 6
+
+PrevLogTerm = leader.log[6].term
+            = 3
+
+Entries = []       // perhaps just heartbeat
+```
+
+Follower doesn't even have index 6.
+
+```text
+Follower → success=false
+```
+
+Leader receives the rejection and does:
+
+```go
+nextIndex[follower]--
+```
+
+Now:
+
+```text
+nextIndex  = 6
+matchIndex = 0
+```
+
+**Notice `matchIndex` did NOT change.** A rejection tells us nothing new about what definitely matches.
+
+### Second attempt
+
+Because `nextIndex = 6`:
+
+```text
+PrevLogIndex = 5
+PrevLogTerm  = 3
+```
+
+Follower checks its index 5:
+
+```text
+Leader:   index 5 → term 3
+Follower: index 5 → term 4
+```
+
+Mismatch → reject again.
+
+Leader:
+
+```text
+nextIndex = 5
+matchIndex = 0
+```
+
+Retry.
+
+Now:
+
+```text
+PrevLogIndex = 4
+PrevLogTerm  = 2
+```
+
+Follower has:
+
+```text
+index 4 → term 4
+```
+
+Mismatch → reject.
+
+Again:
+
+```text
+nextIndex = 4
+matchIndex = 0
+```
+
+### Third retry: now we find the common point
+
+Leader sends:
+
+```text
+PrevLogIndex = 3
+PrevLogTerm  = 2
+```
+
+Follower:
+
+```text
+index 3 → term 2
+```
+
+Match! ✅
+
+This means the leader has discovered:
+
+```text
+                common point
+                     ↓
+Leader:   [1] [1] [2] [2] [3] [3]
+Follower: [1] [1] [2] [4] [4]
+                     ↑
+                  index 3
+```
+
+The leader sends everything from `nextIndex = 4` onward:
+
+```text
+Entries:
+index 4 → term 2
+index 5 → term 3
+index 6 → term 3
+```
+
+The follower sees that its index 4 conflicts:
+
+```text
+Follower old:
+1 1 2 4 4
+      ↑ conflict
+```
+
+So it truncates from index 4:
+
+```text
+1 1 2
+```
+
+and appends the leader's entries:
+
+```text
+1 1 2 2 3 3
+```
+
+Now follower responds:
+
+```text
+Success = true
+```
+
+## Now `nextIndex` AND `matchIndex` change
+
+This successful RPC confirms the follower has entries through index 6.
+
+Leader sets:
+
+```go
+matchIndex[follower] = 6
+nextIndex[follower]  = 7
+```
+
+Think of their relationship as:
+
+```text
+matchIndex
+    ↓
+highest entry I KNOW follower has
+
+nextIndex
+    ↓
+first entry I should send next
+```
+
+Usually after successful replication:
+
+```text
+nextIndex[i] = matchIndex[i] + 1
+```
+
+But don't think they're redundant because during failure/backtracking they're very different:
+
+```text
+                 rejection
+nextIndex:   7 → 6 → 5 → 4
+matchIndex:  0 → 0 → 0 → 0
+```
+
+Then success:
+
+```text
+nextIndex:   4 → 7
+matchIndex:  0 → 6
+```
+
+`nextIndex` is the leader's **working guess / sending cursor**. It moves backward on failures.
+
+`matchIndex` is **confirmed replication progress**. It only moves forward after successful acknowledgements.
+
+### When does the leader actually retire?
+
+A follower saying:
+
+```text
+Success = false
+```
+
+because of a log mismatch **does NOT cause the leader to step down**.
+
+The leader steps down if the response contains a **higher term**.
+
+For example, leader thinks:
+
+```text
+currentTerm = 5
+```
+
+It sends:
+
+```text
+AppendEntries(Term=5)
+```
+
+Follower responds:
+
+```text
+Term    = 6
+Success = false
+```
+
+Now the leader realizes:
+
+> "Someone has already moved the cluster to term 6. I'm stale."
+
+So:
+
+```go
+if reply.Term > currentTerm {
+    currentTerm = reply.Term
+    state = Follower
+    votedFor = -1
+    return
+}
+```
+
+That's a completely different kind of rejection.
+
+So keep these two cases separate:
+
+```text
+AppendEntries rejected
+        |
+        +--- response.Term > myTerm
+        |        ↓
+        |    STEP DOWN
+        |    become follower
+        |
+        +--- same term, log mismatch
+                 ↓
+             stay leader
+                 ↓
+          nextIndex[i]--
+                 ↓
+               retry
+                 ↓
+          eventually succeeds
+                 ↓
+          matchIndex[i] advances
+```
+
+That distinction is fundamental to implementing Raft correctly.
+
+
+
+
+
+Great edge case. This is exactly where the distinction between **replicated**, **committed**, and **applied** matters.
+
+Suppose 5 nodes:
+
+```text
+A = Leader
+B C D E = Followers
+```
+
+Leader A creates entry `X` at index 10, term 5.
+
+### 1. X reaches a majority
+
+```text
+A: X ✓
+B: X ✓
+C: X ✓
+D:
+E:
+```
+
+That's 3/5, so A determines:
+
+```text
+commitIndex = 10
+```
+
+Therefore **X is committed**.
+
+But before A can send another `AppendEntries` carrying:
+
+```text
+LeaderCommit = 10
+```
+
+to B and C...
+
+💥 A crashes.
+
+So you could have:
+
+```text
+        Has X     Knows X committed
+A       ✓         ✓       ← crashed
+B       ✓         ✗
+C       ✓         ✗
+D       ✗         ✗
+E       ✗         ✗
+```
+
+B and C have X in their logs but **haven't applied it yet**.
+
+This is okay.
+
+The important Raft guarantee is not:
+
+> "Once committed, every node immediately knows it's committed."
+
+It's:
+
+> **Once committed, the entry will never be lost.**
+
+Why?
+
+Because X exists on a majority.
+
+---
+
+Now a new election happens.
+
+Raft's voting rules prevent a node with an outdated log from becoming leader if a more up-to-date candidate is competing for the necessary votes.
+
+For example, B becomes leader:
+
+```text
+B log:
+...
+10: X (term 5)
+```
+
+B still may initially not know:
+
+```text
+"X was committed!"
+```
+
+That's the subtle part.
+
+So B **doesn't simply commit X because it sees X on its own log**.
+
+Instead, in its new term, say term 6, B appends a new entry:
+
+```text
+index 11
+term  6
+cmd   NO-OP
+```
+
+and replicates it:
+
+```text
+B: ... X NOOP
+C: ... X NOOP
+D: ... X NOOP
+```
+
+Now index 11 is stored on a majority and, crucially, it's an entry from B's **current term**.
+
+Therefore B can advance:
+
+```text
+commitIndex = 11
+```
+
+And because Raft commit indexes are prefixes:
+
+```text
+if index 11 is committed
+→ everything before 11 is committed too
+```
+
+So:
+
+```text
+index 10: X     ← committed indirectly
+index 11: NOOP  ← committed directly
+```
+
+Now B sends heartbeats:
+
+```text
+AppendEntries {
+    LeaderCommit: 11
+}
+```
+
+Followers receive this and advance:
+
+```text
+commitIndex = min(11, lastLogIndex)
+```
+
+Then their apply loops do:
+
+```text
+lastApplied: 9
+
+apply log[10] → X
+apply log[11] → NOOP
+
+lastApplied: 11
+```
+
+So **X eventually reaches the state machines**.
+
+---
+
+There's one very important nuance in your scenario.
+
+You said:
+
+> "message is replicated across majority"
+
+That does **not always mean committed** in Raft.
+
+If `X` was created in the **current leader's current term**, then yes:
+
+```text
+X.term == currentTerm
++
+X replicated on majority
+        ↓
+X can be committed
+```
+
+But an entry from an **older term** cannot be committed *solely by counting replicas*. That's the rule from your original notes:
+
+```go
+if log[N].Term == currentTerm &&
+   replicatedOnMajority(N) {
+
+    commitIndex = N
+}
+```
+
+Once the new leader commits something from its own term, earlier entries become committed as part of the committed prefix.
+
+### The core idea
+
+Think of these as three separate levels:
+
+```text
+1. APPENDED
+   "It's in my local log."
+
+          ↓ replicated
+
+2. COMMITTED
+   "Raft guarantees this entry will survive
+    leader changes."
+
+          ↓ LeaderCommit / apply loop
+
+3. APPLIED
+   "I have executed this command against
+    my state machine."
+```
+
+So **committed does not mean every follower has already applied it**.
+
+A leader can crash between commitment and broadcasting `LeaderCommit`. The entry is protected by Raft's election/log rules, and a future leader will eventually cause the committed prefix to be recognized and applied.
+
+This is also one reason new Raft leaders commonly append a **no-op entry in their new term**: committing it establishes what prefix of the inherited log is committed.

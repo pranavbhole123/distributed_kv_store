@@ -6,7 +6,6 @@ import (
 	"net/http"
 
 	"github.com/pranavbhole123/distributed_kv_store/internal/store"
-	"github.com/pranavbhole123/distributed_kv_store/internal/wal"
 )
 
 // fist think of what all things we need in this
@@ -15,7 +14,6 @@ type Server struct {
 	addr    string
 	store   store.Store
 	httpSrv *http.Server
-	wal     *wal.WAL
 	cluster ClusterStatus
 }
 
@@ -33,11 +31,10 @@ type SetRequest struct {
 	Value string `json:"value"`
 }
 
-func NewServer(addr string, store store.Store, wal *wal.WAL, cluster ClusterStatus) *Server {
+func NewServer(addr string, store store.Store, cluster ClusterStatus) *Server {
 	return &Server{
 		addr:    addr,
 		store:   store,
-		wal:     wal,
 		cluster: cluster,
 	}
 }
@@ -74,7 +71,7 @@ func (s *Server) setHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.cluster != nil && !s.cluster.WritesReady() {
+	if s.cluster == nil || !s.cluster.WritesReady() {
 		http.Error(w, "writes are unavailable until Raft log replication is implemented", http.StatusServiceUnavailable)
 		return
 	}
@@ -91,23 +88,8 @@ func (s *Server) setHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// write the changes to the wal first
-	if err := s.wal.Append("SET", req.Key, req.Value); err != nil {
-		http.Error(w, "failed to write to WAL", http.StatusInternalServerError)
-		return
-	}
-
-	if err := s.store.Set(req.Key, req.Value); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	w.WriteHeader(http.StatusCreated)
-
-	if _, err := w.Write([]byte("key stored successfully")); err != nil {
-		http.Error(w, "failed to write response", http.StatusInternalServerError)
-		return
-	}
+	// Phase 4.5 replaces this guard with a Raft proposal. A direct store write
+	// here would bypass majority replication and violate Raft safety.
 }
 
 func (s *Server) deleteHandler(w http.ResponseWriter, r *http.Request) {
@@ -115,30 +97,12 @@ func (s *Server) deleteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.cluster != nil && !s.cluster.WritesReady() {
+	if s.cluster == nil || !s.cluster.WritesReady() {
 		http.Error(w, "writes are unavailable until Raft log replication is implemented", http.StatusServiceUnavailable)
 		return
 	}
 
-	key := r.URL.Query().Get("key")
-	if key == "" {
-		http.Error(w, "missing query parameter: key", http.StatusBadRequest)
-		return
-	}
-	if err := s.wal.Append("DELETE", key, ""); err != nil {
-		http.Error(w, "failed to write to WAL", http.StatusInternalServerError)
-		return
-	}
-
-	if err := s.store.Delete(key); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	_, err := w.Write([]byte("key deleted successfully"))
-	if err != nil {
-		http.Error(w, "failed to write response", http.StatusInternalServerError)
-	}
+	// Phase 4.5 replaces this guard with a Raft proposal.
 }
 
 func (s *Server) leaderHandler(w http.ResponseWriter, r *http.Request) {
