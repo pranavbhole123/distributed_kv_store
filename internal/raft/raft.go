@@ -21,11 +21,11 @@ const (
 
 const UnknownLeader = -1
 
-// RequestVoteRequest has no log-position fields yet. Those are added with the
-// replicated log in Phase 4.
 type RequestVoteRequest struct {
-	Term        uint64
-	CandidateID int
+	Term         uint64
+	CandidateID  int
+	LastLogIndex uint64
+	LastLogTerm  uint64
 }
 
 type RequestVoteResponse struct {
@@ -33,11 +33,13 @@ type RequestVoteResponse struct {
 	VoteGranted bool
 }
 
-// AppendEntriesRequest is an empty heartbeat in Phase 3. It will carry log
-// entries and commit information in Phase 4.
 type AppendEntriesRequest struct {
-	Term     uint64
-	LeaderID int
+	Term         uint64
+	LeaderID     int
+	PrevLogIndex uint64
+	PrevLogTerm  uint64
+	Entries      []LogEntry
+	LeaderCommit uint64
 }
 
 type AppendEntriesResponse struct {
@@ -256,6 +258,9 @@ func (r *Raft) HandleRequestVote(_ context.Context, req RequestVoteRequest) Requ
 	if r.votedFor != NoVote && r.votedFor != req.CandidateID {
 		return RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}
 	}
+	if !r.candidateLogIsUpToDateLocked(req.LastLogIndex, req.LastLogTerm) {
+		return RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}
+	}
 
 	// Persist the vote before granting it: after a crash this node must still
 	// remember that it has exhausted its one vote for this term.
@@ -284,13 +289,46 @@ func (r *Raft) HandleAppendEntries(_ context.Context, req AppendEntriesRequest) 
 		r.state = Follower
 		r.leaderID = req.LeaderID
 	}
+	// A current-term leader is still valid while this follower catches up, even
+	// if its log prefix does not currently match.
 	r.signalElectionReset()
+
+	if !r.matchesPrefixLocked(req.PrevLogIndex, req.PrevLogTerm) {
+		return AppendEntriesResponse{Term: r.currentTerm, Success: false}
+	}
+	truncateFrom, entriesToAppend, err := r.replicationPlanLocked(req.PrevLogIndex, req.Entries)
+	if err != nil {
+		return AppendEntriesResponse{Term: r.currentTerm, Success: false}
+	}
+	if truncateFrom != 0 {
+		if err := r.logStore.TruncateFrom(truncateFrom); err != nil {
+			return AppendEntriesResponse{Term: r.currentTerm, Success: false}
+		}
+		// The durable prefix is now authoritative even if appending the new
+		// suffix later fails; the leader will retry the missing suffix.
+		r.log = r.log[:truncateFrom-1]
+	}
+	if len(entriesToAppend) > 0 {
+		if err := r.logStore.Append(entriesToAppend); err != nil {
+			return AppendEntriesResponse{Term: r.currentTerm, Success: false}
+		}
+		r.log = append(r.log, entriesToAppend...)
+	}
+
+	newCommitIndex := min(req.LeaderCommit, uint64(len(r.log)))
+	if newCommitIndex > r.commitIndex {
+		if err := r.saveStableValuesLocked(r.currentTerm, r.votedFor, newCommitIndex, r.lastApplied); err != nil {
+			return AppendEntriesResponse{Term: r.currentTerm, Success: false}
+		}
+		r.commitIndex = newCommitIndex
+	}
 	return AppendEntriesResponse{Term: r.currentTerm, Success: true}
 }
 
 func (r *Raft) startElection(parent context.Context) {
 	r.mu.Lock()
 	term, err := r.becomeCandidateLocked()
+	lastLogIndex, lastLogTerm := r.lastLogInfoLocked()
 	r.mu.Unlock()
 	if err != nil {
 		return
@@ -311,7 +349,12 @@ func (r *Raft) startElection(parent context.Context) {
 		go func(peer config.Node) {
 			ctx, cancel := context.WithTimeout(parent, r.electionTimeoutMin/2)
 			defer cancel()
-			response, err := r.transport.RequestVote(ctx, peer, RequestVoteRequest{Term: term, CandidateID: r.id})
+			response, err := r.transport.RequestVote(ctx, peer, RequestVoteRequest{
+				Term:         term,
+				CandidateID:  r.id,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			})
 			if err == nil {
 				responses <- response
 			}
@@ -357,13 +400,21 @@ func (r *Raft) sendHeartbeats(parent context.Context) {
 		return
 	}
 	term := r.currentTerm
+	lastLogIndex, lastLogTerm := r.lastLogInfoLocked()
+	commitIndex := r.commitIndex
 	r.mu.RUnlock()
 
 	for _, peer := range r.peers {
 		go func(peer config.Node) {
 			ctx, cancel := context.WithTimeout(parent, r.electionTimeoutMin/2)
 			defer cancel()
-			response, err := r.transport.AppendEntries(ctx, peer, AppendEntriesRequest{Term: term, LeaderID: r.id})
+			response, err := r.transport.AppendEntries(ctx, peer, AppendEntriesRequest{
+				Term:         term,
+				LeaderID:     r.id,
+				PrevLogIndex: lastLogIndex,
+				PrevLogTerm:  lastLogTerm,
+				LeaderCommit: commitIndex,
+			})
 			if err == nil && response.Term > term {
 				r.mu.Lock()
 				if response.Term > r.currentTerm {
@@ -410,12 +461,76 @@ func (r *Raft) becomeFollowerLocked(term uint64, leaderID int) error {
 	return nil
 }
 
+func (r *Raft) lastLogInfoLocked() (index uint64, term uint64) {
+	if len(r.log) == 0 {
+		return 0, 0
+	}
+	last := r.log[len(r.log)-1]
+	return last.Index, last.Term
+}
+
+func (r *Raft) candidateLogIsUpToDateLocked(candidateIndex, candidateTerm uint64) bool {
+	localIndex, localTerm := r.lastLogInfoLocked()
+	if candidateTerm != localTerm {
+		return candidateTerm > localTerm
+	}
+	return candidateIndex >= localIndex
+}
+
+func (r *Raft) matchesPrefixLocked(index, term uint64) bool {
+	if index == 0 {
+		return term == 0
+	}
+	if index > uint64(len(r.log)) {
+		return false
+	}
+	return r.log[index-1].Term == term
+}
+
+// replicationPlanLocked determines the smallest durable operations needed for
+// an AppendEntries request. Normal replication only appends; conflict repair
+// truncates an uncommitted suffix first, then appends the leader's suffix.
+func (r *Raft) replicationPlanLocked(prevLogIndex uint64, entries []LogEntry) (truncateFrom uint64, entriesToAppend []LogEntry, err error) {
+	for offset, entry := range entries {
+		expectedIndex := prevLogIndex + uint64(offset) + 1
+		if err := entry.Validate(); err != nil {
+			return 0, nil, err
+		}
+		if entry.Index != expectedIndex {
+			return 0, nil, fmt.Errorf("entry index %d does not follow previous index %d", entry.Index, expectedIndex-1)
+		}
+
+		if entry.Index <= uint64(len(r.log)) {
+			existing := r.log[entry.Index-1]
+			if existing == entry {
+				continue
+			}
+			if existing.Term == entry.Term {
+				return 0, nil, fmt.Errorf("entry %d has matching term but different command", entry.Index)
+			}
+			if entry.Index <= r.commitIndex {
+				return 0, nil, fmt.Errorf("cannot replace committed entry %d", entry.Index)
+			}
+			return entry.Index, entries[offset:], nil
+		}
+		if entry.Index != uint64(len(r.log)+1) {
+			return 0, nil, fmt.Errorf("entry %d leaves a log gap", entry.Index)
+		}
+		return 0, entries[offset:], nil
+	}
+	return 0, nil, nil
+}
+
 func (r *Raft) saveStableLocked(term uint64, votedFor int) error {
+	return r.saveStableValuesLocked(term, votedFor, r.commitIndex, r.lastApplied)
+}
+
+func (r *Raft) saveStableValuesLocked(term uint64, votedFor int, commitIndex uint64, lastApplied uint64) error {
 	return r.stable.Save(StableState{
 		CurrentTerm: term,
 		VotedFor:    votedFor,
-		CommitIndex: r.commitIndex,
-		LastApplied: r.lastApplied,
+		CommitIndex: commitIndex,
+		LastApplied: lastApplied,
 	})
 }
 

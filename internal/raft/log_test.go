@@ -13,7 +13,7 @@ func TestFileLogStoreLoadsDurableEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := LogEntry{Index: 1, Term: 3, Operation: SetOperation, Key: "name", Value: "pranav"}
-	if err := store.Append(entry); err != nil {
+	if err := store.Append([]LogEntry{entry}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -41,7 +41,7 @@ func TestFileLogStoreDiscardsTornFinalRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := LogEntry{Index: 1, Term: 1, Operation: SetOperation, Key: "safe", Value: "entry"}
-	if err := store.Append(entry); err != nil {
+	if err := store.Append([]LogEntry{entry}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

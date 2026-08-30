@@ -21,12 +21,61 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// Phase 3: this has no last-log fields because the replicated Raft log is
-// intentionally deferred to Phase 4.
+type Operation int32
+
+const (
+	Operation_OPERATION_UNSPECIFIED Operation = 0
+	Operation_OPERATION_SET         Operation = 1
+	Operation_OPERATION_DELETE      Operation = 2
+)
+
+// Enum value maps for Operation.
+var (
+	Operation_name = map[int32]string{
+		0: "OPERATION_UNSPECIFIED",
+		1: "OPERATION_SET",
+		2: "OPERATION_DELETE",
+	}
+	Operation_value = map[string]int32{
+		"OPERATION_UNSPECIFIED": 0,
+		"OPERATION_SET":         1,
+		"OPERATION_DELETE":      2,
+	}
+)
+
+func (x Operation) Enum() *Operation {
+	p := new(Operation)
+	*p = x
+	return p
+}
+
+func (x Operation) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Operation) Descriptor() protoreflect.EnumDescriptor {
+	return file_internal_transport_proto_raft_proto_enumTypes[0].Descriptor()
+}
+
+func (Operation) Type() protoreflect.EnumType {
+	return &file_internal_transport_proto_raft_proto_enumTypes[0]
+}
+
+func (x Operation) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Operation.Descriptor instead.
+func (Operation) EnumDescriptor() ([]byte, []int) {
+	return file_internal_transport_proto_raft_proto_rawDescGZIP(), []int{0}
+}
+
 type RequestVoteRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
 	CandidateId   int32                  `protobuf:"varint,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
+	LastLogIndex  uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm   uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -71,6 +120,20 @@ func (x *RequestVoteRequest) GetTerm() uint64 {
 func (x *RequestVoteRequest) GetCandidateId() int32 {
 	if x != nil {
 		return x.CandidateId
+	}
+	return 0
+}
+
+func (x *RequestVoteRequest) GetLastLogIndex() uint64 {
+	if x != nil {
+		return x.LastLogIndex
+	}
+	return 0
+}
+
+func (x *RequestVoteRequest) GetLastLogTerm() uint64 {
+	if x != nil {
+		return x.LastLogTerm
 	}
 	return 0
 }
@@ -127,12 +190,14 @@ func (x *RequestVoteResponse) GetVoteGranted() bool {
 	return false
 }
 
-// Phase 3: AppendEntries is a heartbeat. Entries and commit metadata arrive in
-// Phase 4 with log replication.
 type AppendEntriesRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
 	LeaderId      int32                  `protobuf:"varint,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	PrevLogIndex  uint64                 `protobuf:"varint,3,opt,name=prev_log_index,json=prevLogIndex,proto3" json:"prev_log_index,omitempty"`
+	PrevLogTerm   uint64                 `protobuf:"varint,4,opt,name=prev_log_term,json=prevLogTerm,proto3" json:"prev_log_term,omitempty"`
+	Entries       []*LogEntry            `protobuf:"bytes,5,rep,name=entries,proto3" json:"entries,omitempty"`
+	LeaderCommit  uint64                 `protobuf:"varint,6,opt,name=leader_commit,json=leaderCommit,proto3" json:"leader_commit,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -177,6 +242,34 @@ func (x *AppendEntriesRequest) GetTerm() uint64 {
 func (x *AppendEntriesRequest) GetLeaderId() int32 {
 	if x != nil {
 		return x.LeaderId
+	}
+	return 0
+}
+
+func (x *AppendEntriesRequest) GetPrevLogIndex() uint64 {
+	if x != nil {
+		return x.PrevLogIndex
+	}
+	return 0
+}
+
+func (x *AppendEntriesRequest) GetPrevLogTerm() uint64 {
+	if x != nil {
+		return x.PrevLogTerm
+	}
+	return 0
+}
+
+func (x *AppendEntriesRequest) GetEntries() []*LogEntry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+func (x *AppendEntriesRequest) GetLeaderCommit() uint64 {
+	if x != nil {
+		return x.LeaderCommit
 	}
 	return 0
 }
@@ -233,23 +326,115 @@ func (x *AppendEntriesResponse) GetSuccess() bool {
 	return false
 }
 
+type LogEntry struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Index         uint64                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
+	Term          uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
+	Operation     Operation              `protobuf:"varint,3,opt,name=operation,proto3,enum=distributedkv.raft.v1.Operation" json:"operation,omitempty"`
+	Key           string                 `protobuf:"bytes,4,opt,name=key,proto3" json:"key,omitempty"`
+	Value         string                 `protobuf:"bytes,5,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LogEntry) Reset() {
+	*x = LogEntry{}
+	mi := &file_internal_transport_proto_raft_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LogEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LogEntry) ProtoMessage() {}
+
+func (x *LogEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_transport_proto_raft_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LogEntry.ProtoReflect.Descriptor instead.
+func (*LogEntry) Descriptor() ([]byte, []int) {
+	return file_internal_transport_proto_raft_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *LogEntry) GetIndex() uint64 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+func (x *LogEntry) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *LogEntry) GetOperation() Operation {
+	if x != nil {
+		return x.Operation
+	}
+	return Operation_OPERATION_UNSPECIFIED
+}
+
+func (x *LogEntry) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *LogEntry) GetValue() string {
+	if x != nil {
+		return x.Value
+	}
+	return ""
+}
+
 var File_internal_transport_proto_raft_proto protoreflect.FileDescriptor
 
 const file_internal_transport_proto_raft_proto_rawDesc = "" +
 	"\n" +
-	"#internal/transport/proto/raft.proto\x12\x15distributedkv.raft.v1\"K\n" +
+	"#internal/transport/proto/raft.proto\x12\x15distributedkv.raft.v1\"\x95\x01\n" +
 	"\x12RequestVoteRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
-	"\fcandidate_id\x18\x02 \x01(\x05R\vcandidateId\"L\n" +
+	"\fcandidate_id\x18\x02 \x01(\x05R\vcandidateId\x12$\n" +
+	"\x0elast_log_index\x18\x03 \x01(\x04R\flastLogIndex\x12\"\n" +
+	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\"L\n" +
 	"\x13RequestVoteResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
-	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"G\n" +
+	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"\xf1\x01\n" +
 	"\x14AppendEntriesRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
-	"\tleader_id\x18\x02 \x01(\x05R\bleaderId\"E\n" +
+	"\tleader_id\x18\x02 \x01(\x05R\bleaderId\x12$\n" +
+	"\x0eprev_log_index\x18\x03 \x01(\x04R\fprevLogIndex\x12\"\n" +
+	"\rprev_log_term\x18\x04 \x01(\x04R\vprevLogTerm\x129\n" +
+	"\aentries\x18\x05 \x03(\v2\x1f.distributedkv.raft.v1.LogEntryR\aentries\x12#\n" +
+	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"E\n" +
 	"\x15AppendEntriesResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess2\xdf\x01\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\x9c\x01\n" +
+	"\bLogEntry\x12\x14\n" +
+	"\x05index\x18\x01 \x01(\x04R\x05index\x12\x12\n" +
+	"\x04term\x18\x02 \x01(\x04R\x04term\x12>\n" +
+	"\toperation\x18\x03 \x01(\x0e2 .distributedkv.raft.v1.OperationR\toperation\x12\x10\n" +
+	"\x03key\x18\x04 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x05 \x01(\tR\x05value*O\n" +
+	"\tOperation\x12\x19\n" +
+	"\x15OPERATION_UNSPECIFIED\x10\x00\x12\x11\n" +
+	"\rOPERATION_SET\x10\x01\x12\x14\n" +
+	"\x10OPERATION_DELETE\x10\x022\xdf\x01\n" +
 	"\vRaftService\x12d\n" +
 	"\vRequestVote\x12).distributedkv.raft.v1.RequestVoteRequest\x1a*.distributedkv.raft.v1.RequestVoteResponse\x12j\n" +
 	"\rAppendEntries\x12+.distributedkv.raft.v1.AppendEntriesRequest\x1a,.distributedkv.raft.v1.AppendEntriesResponseBPZNgithub.com/pranavbhole123/distributed_kv_store/internal/transport/proto;raftpbb\x06proto3"
@@ -266,23 +451,28 @@ func file_internal_transport_proto_raft_proto_rawDescGZIP() []byte {
 	return file_internal_transport_proto_raft_proto_rawDescData
 }
 
-var file_internal_transport_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_internal_transport_proto_raft_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_internal_transport_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_internal_transport_proto_raft_proto_goTypes = []any{
-	(*RequestVoteRequest)(nil),    // 0: distributedkv.raft.v1.RequestVoteRequest
-	(*RequestVoteResponse)(nil),   // 1: distributedkv.raft.v1.RequestVoteResponse
-	(*AppendEntriesRequest)(nil),  // 2: distributedkv.raft.v1.AppendEntriesRequest
-	(*AppendEntriesResponse)(nil), // 3: distributedkv.raft.v1.AppendEntriesResponse
+	(Operation)(0),                // 0: distributedkv.raft.v1.Operation
+	(*RequestVoteRequest)(nil),    // 1: distributedkv.raft.v1.RequestVoteRequest
+	(*RequestVoteResponse)(nil),   // 2: distributedkv.raft.v1.RequestVoteResponse
+	(*AppendEntriesRequest)(nil),  // 3: distributedkv.raft.v1.AppendEntriesRequest
+	(*AppendEntriesResponse)(nil), // 4: distributedkv.raft.v1.AppendEntriesResponse
+	(*LogEntry)(nil),              // 5: distributedkv.raft.v1.LogEntry
 }
 var file_internal_transport_proto_raft_proto_depIdxs = []int32{
-	0, // 0: distributedkv.raft.v1.RaftService.RequestVote:input_type -> distributedkv.raft.v1.RequestVoteRequest
-	2, // 1: distributedkv.raft.v1.RaftService.AppendEntries:input_type -> distributedkv.raft.v1.AppendEntriesRequest
-	1, // 2: distributedkv.raft.v1.RaftService.RequestVote:output_type -> distributedkv.raft.v1.RequestVoteResponse
-	3, // 3: distributedkv.raft.v1.RaftService.AppendEntries:output_type -> distributedkv.raft.v1.AppendEntriesResponse
-	2, // [2:4] is the sub-list for method output_type
-	0, // [0:2] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	5, // 0: distributedkv.raft.v1.AppendEntriesRequest.entries:type_name -> distributedkv.raft.v1.LogEntry
+	0, // 1: distributedkv.raft.v1.LogEntry.operation:type_name -> distributedkv.raft.v1.Operation
+	1, // 2: distributedkv.raft.v1.RaftService.RequestVote:input_type -> distributedkv.raft.v1.RequestVoteRequest
+	3, // 3: distributedkv.raft.v1.RaftService.AppendEntries:input_type -> distributedkv.raft.v1.AppendEntriesRequest
+	2, // 4: distributedkv.raft.v1.RaftService.RequestVote:output_type -> distributedkv.raft.v1.RequestVoteResponse
+	4, // 5: distributedkv.raft.v1.RaftService.AppendEntries:output_type -> distributedkv.raft.v1.AppendEntriesResponse
+	4, // [4:6] is the sub-list for method output_type
+	2, // [2:4] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_internal_transport_proto_raft_proto_init() }
@@ -295,13 +485,14 @@ func file_internal_transport_proto_raft_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_transport_proto_raft_proto_rawDesc), len(file_internal_transport_proto_raft_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   4,
+			NumEnums:      1,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_internal_transport_proto_raft_proto_goTypes,
 		DependencyIndexes: file_internal_transport_proto_raft_proto_depIdxs,
+		EnumInfos:         file_internal_transport_proto_raft_proto_enumTypes,
 		MessageInfos:      file_internal_transport_proto_raft_proto_msgTypes,
 	}.Build()
 	File_internal_transport_proto_raft_proto = out.File

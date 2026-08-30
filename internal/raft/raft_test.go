@@ -66,15 +66,7 @@ func (t *localTransport) AppendEntries(ctx context.Context, peer config.Node, re
 func TestThreeNodesElectOneLeader(t *testing.T) {
 	nodes, _ := newTestCluster(t, 3)
 	leader := waitForLeader(t, nodes, time.Second)
-
-	for _, node := range nodes {
-		if node.ID() == leader.ID() {
-			continue
-		}
-		if node.State() != Follower || node.LeaderID() != leader.ID() {
-			t.Fatalf("node %d state = %v, leader = %d; want follower led by %d", node.ID(), node.State(), node.LeaderID(), leader.ID())
-		}
-	}
+	waitForFollowerConvergence(t, nodes, leader.ID(), time.Second)
 }
 
 func TestRemainingNodesReplaceStoppedLeader(t *testing.T) {
@@ -208,4 +200,29 @@ func waitForLeader(t *testing.T, nodes []*Raft, timeout time.Duration) *Raft {
 	}
 	t.Fatal("timed out waiting for exactly one leader")
 	return nil
+}
+
+func waitForFollowerConvergence(t *testing.T, nodes []*Raft, leaderID int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		converged := true
+		for _, node := range nodes {
+			if node.ID() == leaderID {
+				continue
+			}
+			if node.State() != Follower || node.LeaderID() != leaderID {
+				converged = false
+				break
+			}
+		}
+		if converged {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for _, node := range nodes {
+		t.Logf("node %d state=%v leader=%d", node.ID(), node.State(), node.LeaderID())
+	}
+	t.Fatalf("followers did not converge on leader %d", leaderID)
 }

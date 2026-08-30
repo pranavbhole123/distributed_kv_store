@@ -1,6 +1,9 @@
 package raft
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // memoryLogStore keeps existing election-only tests independent of disk. The
 // real node always injects FileLogStore.
@@ -19,10 +22,20 @@ func (s *memoryLogStore) Load() ([]LogEntry, error) {
 	return append([]LogEntry(nil), s.entries...), nil
 }
 
-func (s *memoryLogStore) Append(entry LogEntry) error {
+func (s *memoryLogStore) Append(entries []LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.entries = append(s.entries, entry)
+	s.entries = append(s.entries, entries...)
+	return nil
+}
+
+func (s *memoryLogStore) TruncateFrom(index uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if index == 0 || index > uint64(len(s.entries)+1) {
+		return fmt.Errorf("invalid truncate index %d", index)
+	}
+	s.entries = s.entries[:index-1]
 	return nil
 }
 

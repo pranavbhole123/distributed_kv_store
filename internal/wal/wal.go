@@ -33,23 +33,25 @@ func NewWAL(path string) (*WAL, error) {
 // Append durably writes one length-prefixed record. A record is visible to a
 // caller only after both its bytes and the file metadata have been synced.
 func (w *WAL) Append(record []byte) error {
-	if len(record) == 0 || len(record) > maxRecordSize {
-		return fmt.Errorf("WAL record size %d is invalid", len(record))
-	}
+	return w.AppendBatch([][]byte{record})
+}
 
+// AppendBatch writes all records then fsyncs once. Raft uses this for one
+// AppendEntries RPC so successful replies always cover the complete batch.
+func (w *WAL) AppendBatch(records [][]byte) error {
+	if len(records) == 0 {
+		return nil
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.file == nil {
 		return errors.New("append to closed WAL")
 	}
 
-	var header [4]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(record)))
-	if _, err := w.file.Write(header[:]); err != nil {
-		return fmt.Errorf("write WAL header %q: %w", w.path, err)
-	}
-	if _, err := w.file.Write(record); err != nil {
-		return fmt.Errorf("write WAL record %q: %w", w.path, err)
+	for _, record := range records {
+		if err := writeRecord(w.file, record); err != nil {
+			return fmt.Errorf("write WAL record %q: %w", w.path, err)
+		}
 	}
 	if err := w.file.Sync(); err != nil {
 		return fmt.Errorf("sync WAL %q: %w", w.path, err)
@@ -112,6 +114,62 @@ func (w *WAL) Replay() ([][]byte, error) {
 	return records, nil
 }
 
+// Replace atomically rewrites the complete WAL. Raft uses this when a follower
+// must discard an uncommitted conflicting suffix. The replacement is synced and
+// renamed before this method returns.
+func (w *WAL) Replace(records [][]byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return errors.New("replace closed WAL")
+	}
+
+	dir := filepath.Dir(w.path)
+	temporary, err := os.CreateTemp(dir, ".wal-replace-*")
+	if err != nil {
+		return fmt.Errorf("create WAL replacement for %q: %w", w.path, err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+
+	for _, record := range records {
+		if err := writeRecord(temporary, record); err != nil {
+			temporary.Close()
+			return fmt.Errorf("write WAL replacement %q: %w", w.path, err)
+		}
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return fmt.Errorf("sync WAL replacement %q: %w", w.path, err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close WAL replacement %q: %w", w.path, err)
+	}
+	if err := os.Rename(temporaryPath, w.path); err != nil {
+		return fmt.Errorf("replace WAL %q: %w", w.path, err)
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open WAL directory %q: %w", dir, err)
+	}
+	if err := directory.Sync(); err != nil {
+		directory.Close()
+		return fmt.Errorf("sync WAL directory %q: %w", dir, err)
+	}
+	if err := directory.Close(); err != nil {
+		return fmt.Errorf("close WAL directory %q: %w", dir, err)
+	}
+	if err := w.file.Close(); err != nil {
+		return fmt.Errorf("close replaced WAL %q: %w", w.path, err)
+	}
+	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("reopen replaced WAL %q: %w", w.path, err)
+	}
+	w.file = file
+	return nil
+}
+
 func (w *WAL) truncateLocked(size int64) error {
 	if err := w.file.Truncate(size); err != nil {
 		return fmt.Errorf("truncate torn WAL record %q: %w", w.path, err)
@@ -120,6 +178,19 @@ func (w *WAL) truncateLocked(size int64) error {
 		return fmt.Errorf("sync truncated WAL %q: %w", w.path, err)
 	}
 	return nil
+}
+
+func writeRecord(file *os.File, record []byte) error {
+	if len(record) == 0 || len(record) > maxRecordSize {
+		return fmt.Errorf("WAL record size %d is invalid", len(record))
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(record)))
+	if _, err := file.Write(header[:]); err != nil {
+		return err
+	}
+	_, err := file.Write(record)
+	return err
 }
 
 func (w *WAL) Close() error {

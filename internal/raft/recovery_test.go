@@ -22,7 +22,7 @@ func TestRestartRetainsUncommittedEntryWithoutApplyingIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := LogEntry{Index: 1, Term: 1, Operation: SetOperation, Key: "uncommitted", Value: "value"}
-	if err := logStore.Append(entry); err != nil {
+	if err := logStore.Append([]LogEntry{entry}); err != nil {
 		t.Fatal(err)
 	}
 	if err := logStore.Close(); err != nil {
@@ -59,10 +59,8 @@ func TestRestartReplaysOnlyCommittedPrefix(t *testing.T) {
 	}
 	committed := LogEntry{Index: 1, Term: 4, Operation: SetOperation, Key: "committed", Value: "yes"}
 	uncommitted := LogEntry{Index: 2, Term: 4, Operation: SetOperation, Key: "uncommitted", Value: "no"}
-	for _, entry := range []LogEntry{committed, uncommitted} {
-		if err := logStore.Append(entry); err != nil {
-			t.Fatal(err)
-		}
+	if err := logStore.Append([]LogEntry{committed, uncommitted}); err != nil {
+		t.Fatal(err)
 	}
 	if err := logStore.Close(); err != nil {
 		t.Fatal(err)
