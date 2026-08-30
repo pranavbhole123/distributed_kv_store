@@ -1,0 +1,18 @@
+in append entries there are two types of scenario
+
+1] the follower just need to append new entries from the leader no conflicts
+in this no tension just append the entries and do fsync
+
+2] the problem arises when the follower has a conflict with the leader
+this can arise when lets say and unscucessfull replication process from old leader
+lets say that it didnt reach majority
+
+
+we find the start of the conflict
+in that case we create a new log file and then append new wntries and rename that file 
+to the correct log file name
+
+problem : we do this because we cant just delete entries from WAL
+lets say we begin to delete and crash in middle there would be a huge problem
+
+the solution we have used is crash tolerant

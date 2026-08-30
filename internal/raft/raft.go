@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -20,6 +21,9 @@ const (
 )
 
 const UnknownLeader = -1
+
+// ErrNotLeader tells a client to retry its proposal against the current leader.
+var ErrNotLeader = errors.New("Raft node is not the leader")
 
 type RequestVoteRequest struct {
 	Term         uint64
@@ -45,6 +49,26 @@ type AppendEntriesRequest struct {
 type AppendEntriesResponse struct {
 	Term    uint64
 	Success bool
+}
+
+// Command is a state-machine mutation proposed by a client. Raft assigns its
+// log index and term; callers must not choose either.
+type Command struct {
+	Operation Operation
+	Key       string
+	Value     string
+}
+
+func (c Command) Validate() error {
+	return LogEntry{Index: 1, Operation: c.Operation, Key: c.Key, Value: c.Value}.Validate()
+}
+
+// Result is delivered after a proposal becomes visible in the state machine.
+// Phase 4.3 creates and retains the channel; Phase 4.4's apply loop delivers
+// its result after applying the committed entry.
+type Result struct {
+	Index uint64
+	Err   error
 }
 
 // Transport is the only way Raft communicates with another node. Production
@@ -80,8 +104,17 @@ type Raft struct {
 	log         []LogEntry
 	commitIndex uint64
 	lastApplied uint64
+	nextIndex   map[int]uint64
+	matchIndex  map[int]uint64
+
+	// At most one outbound AppendEntries exchange per follower runs at a time.
+	// This keeps delayed responses from racing each other and regressing the
+	// leader's per-follower sending cursor.
+	replicating    map[int]bool
+	pendingResults map[uint64]chan Result  // way to let the waiting http client know when the work is done
 
 	resetElection chan struct{}
+	replicateNow  chan struct{}
 	cancel        context.CancelFunc
 	wg            sync.WaitGroup
 }
@@ -133,7 +166,12 @@ func NewWithLog(cfg config.Config, stable StableStore, logStore LogStore, applie
 		leaderID:           UnknownLeader,
 		log:                entries,
 		commitIndex:        persisted.CommitIndex,
+		nextIndex:          make(map[int]uint64, len(cfg.Peers)),
+		matchIndex:         make(map[int]uint64, len(cfg.Peers)),
+		replicating:        make(map[int]bool, len(cfg.Peers)),
+		pendingResults:     make(map[uint64]chan Result),
 		resetElection:      make(chan struct{}, 1),
+		replicateNow:       make(chan struct{}, 1),
 	}
 	if r.commitIndex > 0 && r.applier == nil {
 		return nil, fmt.Errorf("committed log requires a state-machine applier")
@@ -237,10 +275,48 @@ func (r *Raft) run(ctx context.Context) {
 			resetTimer(electionTimer, r.randomElectionTimeout())
 		case <-heartbeats.C:
 			if r.IsLeader() {
-				r.sendHeartbeats(ctx)
+				r.replicateAll(ctx)
+			}
+		case <-r.replicateNow:
+			if r.IsLeader() {
+				r.replicateAll(ctx)
 			}
 		}
 	}
+}
+
+// Propose durably appends a client command to this leader's log and starts
+// replication immediately. The returned channel is completed by the Phase 4.4
+// apply loop, only after the entry is committed and applied.
+func (r *Raft) Propose(command Command) (uint64, <-chan Result, error) {
+	if err := command.Validate(); err != nil {
+		return 0, nil, fmt.Errorf("invalid Raft command: %w", err)
+	}
+
+	r.mu.Lock()
+	if r.state != Leader {
+		r.mu.Unlock()
+		return 0, nil, ErrNotLeader
+	}
+	lastLogIndex, _ := r.lastLogInfoLocked()
+	entry := LogEntry{
+		Index:     lastLogIndex + 1,
+		Term:      r.currentTerm,
+		Operation: command.Operation,
+		Key:       command.Key,
+		Value:     command.Value,
+	}
+	if err := r.logStore.Append([]LogEntry{entry}); err != nil {
+		r.mu.Unlock()
+		return 0, nil, fmt.Errorf("persist proposed log entry %d: %w", entry.Index, err)
+	}
+	r.log = append(r.log, entry)
+	result := make(chan Result, 1)
+	r.pendingResults[entry.Index] = result
+	r.mu.Unlock()
+
+	r.signalReplication()
+	return entry.Index, result, nil
 }
 
 func (r *Raft) HandleRequestVote(_ context.Context, req RequestVoteRequest) RequestVoteResponse {
@@ -382,7 +458,7 @@ func (r *Raft) startElection(parent context.Context) {
 				if votes >= majority {
 					r.becomeLeaderLocked()
 					r.mu.Unlock()
-					r.sendHeartbeats(parent)
+					r.signalReplication()
 					return
 				}
 			}
@@ -393,37 +469,168 @@ func (r *Raft) startElection(parent context.Context) {
 	}
 }
 
-func (r *Raft) sendHeartbeats(parent context.Context) {
-	r.mu.RLock()
-	if r.state != Leader {
-		r.mu.RUnlock()
+// replicateAll starts independent replication exchanges for all followers.
+// A follower's exchange is serialized by replicating[peerID], while different
+// followers can make network progress concurrently.
+func (r *Raft) replicateAll(parent context.Context) {
+	for _, peer := range r.peers {
+		go r.replicateToPeer(parent, peer.ID)
+	}
+}
+
+// replicateToPeer drives one follower backwards to a shared prefix, then
+// forwards through the leader's missing suffix. It never holds r.mu during an
+// RPC, so inbound requests and other followers stay independent.
+func (r *Raft) replicateToPeer(parent context.Context, peerID int) {
+	peer, ok := r.peerByID(peerID)
+	if !ok {
 		return
 	}
-	term := r.currentTerm
-	lastLogIndex, lastLogTerm := r.lastLogInfoLocked()
-	commitIndex := r.commitIndex
-	r.mu.RUnlock()
-
-	for _, peer := range r.peers {
-		go func(peer config.Node) {
-			ctx, cancel := context.WithTimeout(parent, r.electionTimeoutMin/2)
-			defer cancel()
-			response, err := r.transport.AppendEntries(ctx, peer, AppendEntriesRequest{
-				Term:         term,
-				LeaderID:     r.id,
-				PrevLogIndex: lastLogIndex,
-				PrevLogTerm:  lastLogTerm,
-				LeaderCommit: commitIndex,
-			})
-			if err == nil && response.Term > term {
-				r.mu.Lock()
-				if response.Term > r.currentTerm {
-					_ = r.becomeFollowerLocked(response.Term, UnknownLeader)
-				}
-				r.mu.Unlock()
-			}
-		}(peer)
+	if !r.beginReplication(peerID) {
+		return
 	}
+	defer r.endReplication(peerID)
+
+	ctx, cancel := context.WithTimeout(parent, r.electionTimeoutMin/2)
+	defer cancel()
+	for {
+		request, ok := r.buildAppendEntries(peerID)
+		if !ok {
+			return
+		}
+		response, err := r.transport.AppendEntries(ctx, peer, request)
+		if err != nil {
+			return
+		}
+		if !r.handleAppendEntriesResponse(peerID, request, response) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+}
+
+// buildAppendEntries snapshots the precise prefix and suffix for one peer.
+// nextIndex is the first entry the follower is missing, so its predecessor is
+// the prefix the follower must prove it has before accepting the suffix.
+func (r *Raft) buildAppendEntries(peerID int) (AppendEntriesRequest, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.state != Leader {
+		return AppendEntriesRequest{}, false
+	}
+	next, ok := r.nextIndex[peerID]
+	if !ok || next == 0 || next > uint64(len(r.log))+1 {
+		return AppendEntriesRequest{}, false
+	}
+
+	previous := next - 1
+	var previousTerm uint64
+	if previous > 0 {
+		previousTerm = r.log[previous-1].Term
+	}
+	entries := append([]LogEntry(nil), r.log[previous:]...)
+	return AppendEntriesRequest{
+		Term:         r.currentTerm,
+		LeaderID:     r.id,
+		PrevLogIndex: previous,
+		PrevLogTerm:  previousTerm,
+		Entries:      entries,
+		LeaderCommit: r.commitIndex,
+	}, true
+}
+
+// handleAppendEntriesResponse updates the replication facts learned from one
+// RPC. It returns true only when a same-term rejection should be retried with
+// an earlier prefix.
+func (r *Raft) handleAppendEntriesResponse(peerID int, request AppendEntriesRequest, response AppendEntriesResponse) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if response.Term > r.currentTerm {
+		_ = r.becomeFollowerLocked(response.Term, UnknownLeader)
+		return false
+	}
+	if r.state != Leader || request.Term != r.currentTerm || response.Term != r.currentTerm {
+		return false
+	}
+	if !response.Success {
+		if r.nextIndex[peerID] <= 1 {
+			return false
+		}
+		r.nextIndex[peerID]--
+		return true
+	}
+
+	matched := request.PrevLogIndex + uint64(len(request.Entries))
+	if matched > r.matchIndex[peerID] {
+		r.matchIndex[peerID] = matched
+	}
+	if r.nextIndex[peerID] < r.matchIndex[peerID]+1 {
+		r.nextIndex[peerID] = r.matchIndex[peerID] + 1
+	}
+	if r.advanceCommitIndexLocked() {
+		r.signalReplication()
+	}
+	return false
+}
+
+// advanceCommitIndexLocked commits the greatest current-term entry known to be
+// replicated on a quorum, counting this leader as one replica. It reports
+// whether the persisted commit index advanced.
+func (r *Raft) advanceCommitIndexLocked() bool {
+	for index := uint64(len(r.log)); index > r.commitIndex; index-- {
+		if r.log[index-1].Term != r.currentTerm {
+			continue
+		}
+		matched := 1 // the leader always has its own log entry
+		for _, peer := range r.peers {
+			if r.matchIndex[peer.ID] >= index {
+				matched++
+			}
+		}
+		if matched < r.majority() {
+			continue
+		}
+		if err := r.saveStableValuesLocked(r.currentTerm, r.votedFor, index, r.lastApplied); err != nil {
+			return false
+		}
+		r.commitIndex = index
+		return true
+	}
+	return false
+}
+
+func (r *Raft) beginReplication(peerID int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != Leader || r.replicating[peerID] {
+		return false
+	}
+	r.replicating[peerID] = true
+	return true
+}
+
+func (r *Raft) endReplication(peerID int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.replicating, peerID)
+}
+
+func (r *Raft) peerByID(peerID int) (config.Node, bool) {
+	for _, peer := range r.peers {
+		if peer.ID == peerID {
+			return peer, true
+		}
+	}
+	return config.Node{}, false
+}
+
+func (r *Raft) majority() int {
+	return (len(r.peers)+1)/2 + 1
 }
 
 func (r *Raft) becomeCandidateLocked() (uint64, error) {
@@ -441,6 +648,13 @@ func (r *Raft) becomeCandidateLocked() (uint64, error) {
 func (r *Raft) becomeLeaderLocked() {
 	r.state = Leader
 	r.leaderID = r.id
+	lastLogIndex, _ := r.lastLogInfoLocked()
+	r.nextIndex = make(map[int]uint64, len(r.peers))
+	r.matchIndex = make(map[int]uint64, len(r.peers))
+	for _, peer := range r.peers {
+		r.nextIndex[peer.ID] = lastLogIndex + 1
+		r.matchIndex[peer.ID] = 0
+	}
 }
 
 // becomeFollowerLocked durably advances the term when necessary. It is called
@@ -537,6 +751,15 @@ func (r *Raft) saveStableValuesLocked(term uint64, votedFor int, commitIndex uin
 func (r *Raft) signalElectionReset() {
 	select {
 	case r.resetElection <- struct{}{}:
+	default:
+	}
+}
+
+// signalReplication coalesces triggers: one outstanding signal is enough,
+// because replication always builds requests from the latest leader state.
+func (r *Raft) signalReplication() {
+	select {
+	case r.replicateNow <- struct{}{}:
 	default:
 	}
 }

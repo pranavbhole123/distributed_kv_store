@@ -1,0 +1,107 @@
+Raft leaders only directly advance `commitIndex` based on majority replication for entries from their current term.
+why ? explain properly
+
+
+This is one of the most subtle parts of Raft. Let me explain with a concrete example first.
+
+---
+
+## The scenario that breaks without this rule
+
+```
+5 nodes: N1, N2, N3, N4, N5
+
+Term 1: N1 is leader
+N1 appends entry X at index 2
+N1 replicates to N2 — majority not reached yet
+N1 crashes before committing
+```
+
+```
+Term 2: N5 wins election (had fewer entries, won due to randomness)
+N5 is leader for term 2
+N5 appends entry Y at index 2 — different entry same index
+N5 replicates Y to N3, N4 — majority reached
+N5 crashes before committing
+```
+
+```
+Term 3: N1 comes back, wins election
+N1 still has entry X at index 2
+N1 sees X is on N1 and N2 — that's majority of 5? No, 2 out of 5
+But what if N1 tries to commit X now?
+```
+
+Now here's the dangerous part:
+
+```
+Term 3: N1 is leader
+N1 sees entry X at index 2 exists on N1 and N2
+N1 thinks — hey X is on majority, let me commit it
+N1 commits X, tells client OK
+```
+
+But N3 and N4 have entry Y at index 2 from term 2. N5 comes back with Y too. Now 3 nodes have Y and 2 nodes have X committed. Data corruption — two different values committed at same index.
+
+---
+
+## Why this happens
+
+The problem is N1 committed an entry from a **previous term** (term 1) by counting replicas in the current term (term 3). The replication count from term 1 is stale — it happened before N5 became leader and potentially overwrote those entries.
+
+---
+
+## The fix — only commit entries from current term directly
+
+```
+N1 is leader for term 3
+N1 appends new entry Z at index 3 — from term 3
+N1 replicates Z to N2, N3 — majority reached
+N1 commits Z
+
+By committing Z at index 3 — the log matching property guarantees
+everything before index 3 is identical on N1, N2, N3
+This INDIRECTLY commits X at index 2 as well
+```
+
+Entry X from term 1 gets committed — but only as a side effect of committing a newer entry from the current term. Not by directly counting its replicas.
+
+---
+
+## The rule in code
+
+```go
+// WRONG — committing old term entry directly
+if matchCount >= majority {
+    commitIndex = N  // dangerous if log[N].term != currentTerm
+}
+
+// CORRECT — only commit if entry is from current term
+if matchCount >= majority && log[N].term == currentTerm {
+    commitIndex = N  // safe — commits this and everything before it
+}
+```
+
+---
+
+## Why current term entries are safe to commit directly
+
+When N1 is leader for term 3 and replicates entry Z to majority:
+
+```
+Those majority nodes accepted Z
+To accept Z they passed the prevLogIndex check
+That check guarantees their logs match N1's log up to index before Z
+So all entries before Z on those nodes are identical to N1
+Committing Z safely commits everything before it too
+```
+
+Old term entries don't have this guarantee — they were replicated under a different leader that may have since been overridden.
+
+---
+
+## One line summary
+
+Committing old entries directly can conflict with entries committed by leaders in between. Committing a current-term entry uses the log matching property to safely commit everything before it as a side effect — no conflicts possible.
+
+This is section 5.4.2 in the Raft paper — "Committing entries from previous terms." Worth reading that specific section.
