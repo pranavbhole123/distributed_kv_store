@@ -145,7 +145,13 @@ func newTestCluster(t *testing.T, size int) ([]*Raft, *localTransport) {
 	transport := newLocalTransport()
 	nodes := make([]*Raft, 0, size)
 	for id := 1; id <= size; id++ {
-		node, err := New(testConfig(id, size), NewFileStableStore(filepath.Join(t.TempDir(), fmt.Sprintf("node-%d", id), "raft-state.json")), transport)
+		node, err := NewWithLog(
+			testConfig(id, size),
+			NewFileStableStore(filepath.Join(t.TempDir(), fmt.Sprintf("node-%d", id), "raft-state.json")),
+			newMemoryLogStore(),
+			&recordingApplier{},
+			transport,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}

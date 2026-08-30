@@ -33,3 +33,16 @@ array offsets.
 The leader itself counts as one replica when deciding whether a majority has
 replicated an entry. It only advances `commitIndex` for entries from its
 current term, as required by Raft's commitment rule.
+
+## Commit, apply, and client acknowledgement
+
+`commitIndex` means an entry is immutable Raft history; it does not by itself
+mean the KV state machine has executed that entry. A single Raft apply loop
+therefore advances `lastApplied` one entry at a time, invokes the injected
+`Applier` outside the Raft mutex, persists `lastApplied`, and only then wakes
+the waiting proposal result.
+
+The current memory store is rebuilt from committed history after a process
+restart, so recovery starts application from index zero even if a previous
+`lastApplied` value was persisted. The durable `lastApplied` checkpoint becomes
+authoritative once the project adds snapshots or a durable state machine.

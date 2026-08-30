@@ -25,6 +25,10 @@ const UnknownLeader = -1
 // ErrNotLeader tells a client to retry its proposal against the current leader.
 var ErrNotLeader = errors.New("Raft node is not the leader")
 
+// ErrNoApplier prevents a leader from accepting a write it could commit but
+// never make visible locally.
+var ErrNoApplier = errors.New("Raft node has no state-machine applier")
+
 type RequestVoteRequest struct {
 	Term         uint64
 	CandidateID  int
@@ -111,10 +115,12 @@ type Raft struct {
 	// This keeps delayed responses from racing each other and regressing the
 	// leader's per-follower sending cursor.
 	replicating    map[int]bool
-	pendingResults map[uint64]chan Result  // way to let the waiting http client know when the work is done
+	pendingResults map[uint64]chan Result // way to let the waiting http client know when the work is done
+	applyErr       error
 
 	resetElection chan struct{}
 	replicateNow  chan struct{}
+	applyNow      chan struct{}
 	cancel        context.CancelFunc
 	wg            sync.WaitGroup
 }
@@ -172,6 +178,7 @@ func NewWithLog(cfg config.Config, stable StableStore, logStore LogStore, applie
 		pendingResults:     make(map[uint64]chan Result),
 		resetElection:      make(chan struct{}, 1),
 		replicateNow:       make(chan struct{}, 1),
+		applyNow:           make(chan struct{}, 1),
 	}
 	if r.commitIndex > 0 && r.applier == nil {
 		return nil, fmt.Errorf("committed log requires a state-machine applier")
@@ -204,10 +211,11 @@ func (r *Raft) Start(parent context.Context) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	r.cancel = cancel
-	r.wg.Add(1)
+	r.wg.Add(2)
 	r.mu.Unlock()
 
 	go r.run(ctx)
+	go r.applyLoop(ctx)
 }
 
 func (r *Raft) Stop() {
@@ -297,6 +305,15 @@ func (r *Raft) Propose(command Command) (uint64, <-chan Result, error) {
 	if r.state != Leader {
 		r.mu.Unlock()
 		return 0, nil, ErrNotLeader
+	}
+	if r.applier == nil {
+		r.mu.Unlock()
+		return 0, nil, ErrNoApplier
+	}
+	if r.applyErr != nil {
+		err := r.applyErr
+		r.mu.Unlock()
+		return 0, nil, fmt.Errorf("Raft state machine is unavailable: %w", err)
 	}
 	lastLogIndex, _ := r.lastLogInfoLocked()
 	entry := LogEntry{
@@ -397,6 +414,7 @@ func (r *Raft) HandleAppendEntries(_ context.Context, req AppendEntriesRequest) 
 			return AppendEntriesResponse{Term: r.currentTerm, Success: false}
 		}
 		r.commitIndex = newCommitIndex
+		r.signalApply()
 	}
 	return AppendEntriesResponse{Term: r.currentTerm, Success: true}
 }
@@ -599,6 +617,7 @@ func (r *Raft) advanceCommitIndexLocked() bool {
 			return false
 		}
 		r.commitIndex = index
+		r.signalApply()
 		return true
 	}
 	return false
@@ -761,6 +780,88 @@ func (r *Raft) signalReplication() {
 	select {
 	case r.replicateNow <- struct{}{}:
 	default:
+	}
+}
+
+// signalApply wakes the single apply loop. Signals are intentionally
+// coalesced: the loop drains every entry through the latest commit index.
+func (r *Raft) signalApply() {
+	select {
+	case r.applyNow <- struct{}{}:
+	default:
+	}
+}
+
+// applyLoop is the sole owner of state-machine application. It snapshots one
+// committed entry under the Raft mutex, releases the mutex for the potentially
+// slow state-machine call, then persists lastApplied before notifying a client.
+func (r *Raft) applyLoop(ctx context.Context) {
+	defer r.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.applyNow:
+			if err := r.applyCommitted(); err != nil {
+				r.recordApplyFailure(err)
+				return
+			}
+		}
+	}
+}
+
+func (r *Raft) applyCommitted() error {
+	for {
+		r.mu.RLock()
+		if r.lastApplied >= r.commitIndex {
+			r.mu.RUnlock()
+			return nil
+		}
+		if r.applier == nil {
+			r.mu.RUnlock()
+			return ErrNoApplier
+		}
+		entry := r.log[r.lastApplied]
+		applier := r.applier
+		r.mu.RUnlock()
+
+		if err := applier.Apply(entry); err != nil {
+			return fmt.Errorf("apply committed log entry %d: %w", entry.Index, err)
+		}
+
+		r.mu.Lock()
+		// There is only one apply loop, and committed log entries are immutable,
+		// so this should always be the next entry. Keep the check explicit: it
+		// protects the persistence checkpoint from future concurrency changes.
+		if r.lastApplied+1 != entry.Index {
+			r.mu.Unlock()
+			return fmt.Errorf("apply order changed: last applied %d, entry %d", r.lastApplied, entry.Index)
+		}
+		if err := r.saveStableValuesLocked(r.currentTerm, r.votedFor, r.commitIndex, entry.Index); err != nil {
+			r.mu.Unlock()
+			return fmt.Errorf("persist last applied index %d: %w", entry.Index, err)
+		}
+		r.lastApplied = entry.Index
+		if result, waiting := r.pendingResults[entry.Index]; waiting {
+			result <- Result{Index: entry.Index}
+			close(result)
+			delete(r.pendingResults, entry.Index)
+		}
+		r.mu.Unlock()
+	}
+}
+
+func (r *Raft) recordApplyFailure(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.applyErr != nil {
+		return
+	}
+	r.applyErr = err
+	for index, result := range r.pendingResults {
+		result <- Result{Index: index, Err: err}
+		close(result)
+		delete(r.pendingResults, index)
 	}
 }
 

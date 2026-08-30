@@ -11,6 +11,7 @@ import (
 func TestLeaderProposeReplicatesAndCommitsOnMajority(t *testing.T) {
 	nodes, _ := newTestCluster(t, 3)
 	leader := waitForLeader(t, nodes, time.Second)
+	waitForFollowerConvergence(t, nodes, leader.ID(), time.Second)
 
 	for _, node := range nodes {
 		if node.ID() == leader.ID() {
@@ -29,20 +30,22 @@ func TestLeaderProposeReplicatesAndCommitsOnMajority(t *testing.T) {
 	if index != 1 {
 		t.Fatalf("proposal index = %d, want 1", index)
 	}
-	select {
-	case got := <-result:
-		t.Fatalf("proposal completed before Phase 4.4 apply loop: %+v", got)
-	default:
-	}
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if leader.CommitIndex() >= index && followersWithEntry(nodes, leader.ID(), index) >= 1 {
-			return
+			select {
+			case got := <-result:
+				if got.Index != index || got.Err != nil {
+					t.Fatalf("proposal result = %+v, want successful index %d", got, index)
+				}
+				return
+			default:
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("proposal was not replicated and committed: leader commit=%d followers with entry=%d", leader.CommitIndex(), followersWithEntry(nodes, leader.ID(), index))
+	t.Fatalf("proposal was not replicated, committed, and applied: leader commit=%d applied=%d followers with entry=%d", leader.CommitIndex(), leader.LastApplied(), followersWithEntry(nodes, leader.ID(), index))
 }
 
 func TestReplicationBacktracksNextIndexAndRepairsFollower(t *testing.T) {
