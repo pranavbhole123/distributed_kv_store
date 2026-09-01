@@ -36,6 +36,8 @@ message AppendEntriesResponse {
 }
 
 enum Operation {
+  // The zero value represents Raft's internal leader no-op. Clients cannot
+  // create it; Raft uses it to commit inherited prior-term entries safely.
   OPERATION_UNSPECIFIED = 0;
   OPERATION_SET = 1;
   OPERATION_DELETE = 2;

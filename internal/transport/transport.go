@@ -93,6 +93,8 @@ func logEntryFromProto(entry *raftpb.LogEntry) raft.LogEntry {
 
 func operationToProto(operation raft.Operation) raftpb.Operation {
 	switch operation {
+	case raft.NoopOperation:
+		return raftpb.Operation_OPERATION_UNSPECIFIED
 	case raft.SetOperation:
 		return raftpb.Operation_OPERATION_SET
 	case raft.DeleteOperation:
@@ -104,11 +106,13 @@ func operationToProto(operation raft.Operation) raftpb.Operation {
 
 func operationFromProto(operation raftpb.Operation) raft.Operation {
 	switch operation {
+	case raftpb.Operation_OPERATION_UNSPECIFIED:
+		return raft.NoopOperation
 	case raftpb.Operation_OPERATION_SET:
 		return raft.SetOperation
 	case raftpb.Operation_OPERATION_DELETE:
 		return raft.DeleteOperation
 	default:
-		return ""
+		return "invalid"
 	}
 }

@@ -58,3 +58,20 @@ the client and leader rather than adding another request/response protocol.
 The leader's wait is bounded. An isolated node that still believes it is leader
 cannot obtain a majority, so its HTTP request returns a retryable 503 rather
 than a false success.
+
+## Leader no-op establishes inherited commitment
+
+A newly elected leader appends a durable internal no-op in its own term. When a
+quorum replicates that no-op, Raft can commit it by the current-term rule and
+therefore commits every preceding inherited entry too. This prevents a
+successfully committed older-term write from remaining invisible after its
+original leader crashes before followers receive the updated commit index.
+  
+## Client request IDs are a later durable feature
+
+An HTTP timeout cannot tell a client whether its write committed before the
+response was lost. A request ID must therefore live in the durable Raft command
+and in the reconstructed state-machine deduplication state, not merely in an
+HTTP-local map. The current API deliberately does not claim duplicate-request
+suppression; request IDs are deferred until that complete end-to-end contract
+is implemented.

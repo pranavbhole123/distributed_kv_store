@@ -64,6 +64,9 @@ type Command struct {
 }
 
 func (c Command) Validate() error {
+	if c.Operation == NoopOperation {
+		return errors.New("client command cannot be a Raft NOOP")
+	}
 	return LogEntry{Index: 1, Operation: c.Operation, Key: c.Key, Value: c.Value}.Validate()
 }
 
@@ -180,13 +183,15 @@ func NewWithLog(cfg config.Config, stable StableStore, logStore LogStore, applie
 		replicateNow:       make(chan struct{}, 1),
 		applyNow:           make(chan struct{}, 1),
 	}
-	if r.commitIndex > 0 && r.applier == nil {
-		return nil, fmt.Errorf("committed log requires a state-machine applier")
-	}
 	for r.lastApplied < r.commitIndex {
 		entry := r.log[r.lastApplied]
-		if err := r.applier.Apply(entry); err != nil {
-			return nil, fmt.Errorf("replay committed log entry %d: %w", entry.Index, err)
+		if entry.Operation != NoopOperation {
+			if r.applier == nil {
+				return nil, fmt.Errorf("committed log entry %d requires a state-machine applier", entry.Index)
+			}
+			if err := r.applier.Apply(entry); err != nil {
+				return nil, fmt.Errorf("replay committed log entry %d: %w", entry.Index, err)
+			}
 		}
 		r.lastApplied++
 	}
@@ -432,9 +437,12 @@ func (r *Raft) startElection(parent context.Context) {
 	if majority == 1 {
 		r.mu.Lock()
 		if r.state == Candidate && r.currentTerm == term {
-			r.becomeLeaderLocked()
+			err = r.becomeLeaderLocked()
 		}
 		r.mu.Unlock()
+		if err == nil {
+			r.signalReplication()
+		}
 		return
 	}
 
@@ -474,9 +482,11 @@ func (r *Raft) startElection(parent context.Context) {
 			if response.Term == term && response.VoteGranted {
 				votes++
 				if votes >= majority {
-					r.becomeLeaderLocked()
+					err = r.becomeLeaderLocked()
 					r.mu.Unlock()
-					r.signalReplication()
+					if err == nil {
+						r.signalReplication()
+					}
 					return
 				}
 			}
@@ -664,16 +674,26 @@ func (r *Raft) becomeCandidateLocked() (uint64, error) {
 	return newTerm, nil
 }
 
-func (r *Raft) becomeLeaderLocked() {
+// becomeLeaderLocked appends a current-term no-op before becoming leader.
+// Committing that no-op establishes commitment of any preceding entries from
+// earlier terms which this leader inherited but cannot directly commit itself.
+func (r *Raft) becomeLeaderLocked() error {
+	lastLogIndex, _ := r.lastLogInfoLocked()
+	noop := LogEntry{Index: lastLogIndex + 1, Term: r.currentTerm, Operation: NoopOperation}
+	if err := r.logStore.Append([]LogEntry{noop}); err != nil {
+		return fmt.Errorf("persist leader no-op at index %d: %w", noop.Index, err)
+	}
+	r.log = append(r.log, noop)
 	r.state = Leader
 	r.leaderID = r.id
-	lastLogIndex, _ := r.lastLogInfoLocked()
+	lastLogIndex = noop.Index
 	r.nextIndex = make(map[int]uint64, len(r.peers))
 	r.matchIndex = make(map[int]uint64, len(r.peers))
 	for _, peer := range r.peers {
 		r.nextIndex[peer.ID] = lastLogIndex + 1
 		r.matchIndex[peer.ID] = 0
 	}
+	return nil
 }
 
 // becomeFollowerLocked durably advances the term when necessary. It is called
@@ -817,16 +837,18 @@ func (r *Raft) applyCommitted() error {
 			r.mu.RUnlock()
 			return nil
 		}
-		if r.applier == nil {
+		entry := r.log[r.lastApplied]
+		if entry.Operation != NoopOperation && r.applier == nil {
 			r.mu.RUnlock()
 			return ErrNoApplier
 		}
-		entry := r.log[r.lastApplied]
 		applier := r.applier
 		r.mu.RUnlock()
 
-		if err := applier.Apply(entry); err != nil {
-			return fmt.Errorf("apply committed log entry %d: %w", entry.Index, err)
+		if entry.Operation != NoopOperation {
+			if err := applier.Apply(entry); err != nil {
+				return fmt.Errorf("apply committed log entry %d: %w", entry.Index, err)
+			}
 		}
 
 		r.mu.Lock()

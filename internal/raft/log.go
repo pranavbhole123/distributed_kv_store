@@ -11,6 +11,10 @@ import (
 type Operation string
 
 const (
+	// NoopOperation is an internal Raft entry appended by a newly elected
+	// leader. It maps to protobuf's zero/unspecified enum value and is never a
+	// client command.
+	NoopOperation   Operation = ""
 	SetOperation    Operation = "SET"
 	DeleteOperation Operation = "DELETE"
 )
@@ -29,12 +33,19 @@ func (e LogEntry) Validate() error {
 	if e.Index == 0 {
 		return fmt.Errorf("log entry index must be positive")
 	}
-	if e.Key == "" {
-		return fmt.Errorf("log entry key cannot be empty")
-	}
 	switch e.Operation {
+	case NoopOperation:
+		if e.Key != "" || e.Value != "" {
+			return fmt.Errorf("NOOP entry %d cannot contain a key or value", e.Index)
+		}
 	case SetOperation:
+		if e.Key == "" {
+			return fmt.Errorf("SET entry %d key cannot be empty", e.Index)
+		}
 	case DeleteOperation:
+		if e.Key == "" {
+			return fmt.Errorf("DELETE entry %d key cannot be empty", e.Index)
+		}
 		if e.Value != "" {
 			return fmt.Errorf("DELETE entry %d cannot contain a value", e.Index)
 		}

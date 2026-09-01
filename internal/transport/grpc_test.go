@@ -64,6 +64,20 @@ func TestGRPCTransportDeliversRaftRPCs(t *testing.T) {
 	}
 }
 
+func TestNoopLogEntryRoundTripsThroughProto(t *testing.T) {
+	request := raft.AppendEntriesRequest{
+		Term:     4,
+		LeaderID: 1,
+		Entries: []raft.LogEntry{
+			{Index: 7, Term: 4, Operation: raft.NoopOperation},
+		},
+	}
+	roundTripped := appendEntriesFromProto(appendEntriesToProto(request))
+	if len(roundTripped.Entries) != 1 || roundTripped.Entries[0] != request.Entries[0] {
+		t.Fatalf("round-tripped entries = %+v, want %+v", roundTripped.Entries, request.Entries)
+	}
+}
+
 func TestTwoFreshNodesElectLeaderWithThirdPeerOffline(t *testing.T) {
 	listener1 := newTestListener(t)
 	listener2 := newTestListener(t)

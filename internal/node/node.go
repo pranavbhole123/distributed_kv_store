@@ -170,6 +170,8 @@ type storeApplier struct {
 
 func (a storeApplier) Apply(entry raft.LogEntry) error {
 	switch entry.Operation {
+	case raft.NoopOperation:
+		return nil
 	case raft.SetOperation:
 		return a.store.Set(entry.Key, entry.Value)
 	case raft.DeleteOperation:

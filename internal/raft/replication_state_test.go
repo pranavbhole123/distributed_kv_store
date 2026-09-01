@@ -27,8 +27,8 @@ func TestLeaderProposeReplicatesAndCommitsOnMajority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if index != 1 {
-		t.Fatalf("proposal index = %d, want 1", index)
+	if index != 2 {
+		t.Fatalf("proposal index = %d, want 2 after the leader's no-op", index)
 	}
 
 	deadline := time.Now().Add(time.Second)
@@ -81,7 +81,10 @@ func TestReplicationBacktracksNextIndexAndRepairsFollower(t *testing.T) {
 	transport.register(follower)
 
 	leader.mu.Lock()
-	leader.becomeLeaderLocked()
+	if err := leader.becomeLeaderLocked(); err != nil {
+		leader.mu.Unlock()
+		t.Fatal(err)
+	}
 	leader.mu.Unlock()
 	leader.replicateToPeer(context.Background(), follower.ID())
 
@@ -90,17 +93,17 @@ func TestReplicationBacktracksNextIndexAndRepairsFollower(t *testing.T) {
 	matched := leader.matchIndex[follower.ID()]
 	committed := leader.commitIndex
 	leader.mu.RUnlock()
-	if next != 4 || matched != 3 {
-		t.Fatalf("leader replication state next=%d match=%d; want next=4 match=3", next, matched)
+	if next != 5 || matched != 4 {
+		t.Fatalf("leader replication state next=%d match=%d; want next=5 match=4", next, matched)
 	}
-	if committed != 3 {
-		t.Fatalf("leader commit index = %d, want 3 after leader plus one follower replicated current-term entry", committed)
+	if committed != 4 {
+		t.Fatalf("leader commit index = %d, want 4 after leader plus one follower replicated current-term no-op", committed)
 	}
 
 	follower.mu.RLock()
 	entries := append([]LogEntry(nil), follower.log...)
 	follower.mu.RUnlock()
-	if len(entries) != 3 || entries[2].Term != 2 || entries[2].Value != "3" {
+	if len(entries) != 4 || entries[2].Term != 2 || entries[2].Value != "3" || entries[3].Operation != NoopOperation {
 		t.Fatalf("follower log = %+v, want repaired leader log", entries)
 	}
 }
