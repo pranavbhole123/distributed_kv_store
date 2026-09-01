@@ -1,0 +1,3 @@
+why make deletes idempotent 
+
+[memory.go](/home/pranav/Desktop/distributed_kv_store/internal/store/memory.go) makes DELETE idempotent—a necessary property for safe recovery/replay.

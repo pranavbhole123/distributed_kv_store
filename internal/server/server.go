@@ -3,18 +3,26 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
+	"time"
 
 	"github.com/pranavbhole123/distributed_kv_store/internal/store"
 )
 
+const writeTimeout = 2 * time.Second
+
 // fist think of what all things we need in this
 // we alson need the store interface in this
 type Server struct {
-	addr    string
-	store   store.Store
-	httpSrv *http.Server
-	cluster ClusterStatus
+	addr           string
+	store          store.Store
+	httpSrv        *http.Server
+	cluster        ClusterStatus
+	writes         WriteCoordinator
+	maxValueLength int
 }
 
 // ClusterStatus supplies only the cluster information needed by HTTP handlers.
@@ -23,7 +31,16 @@ type ClusterStatus interface {
 	LeaderID() int
 	CurrentTerm() uint64
 	LeaderHTTPAddr() (string, bool)
-	WritesReady() bool
+}
+
+// WriteCoordinator is the complete write boundary required by HTTP. It keeps
+// handlers independent of Raft types and lets Node own the wait for a proposal
+// to become committed and applied.
+type WriteCoordinator interface {
+	IsLeader() bool
+	ProposeSet(context.Context, string, string) error
+	ProposeDelete(context.Context, string) error
+	LeaderHTTPAddr() (string, bool)
 }
 
 type SetRequest struct {
@@ -31,11 +48,13 @@ type SetRequest struct {
 	Value string `json:"value"`
 }
 
-func NewServer(addr string, store store.Store, cluster ClusterStatus) *Server {
+func NewServer(addr string, store store.Store, cluster ClusterStatus, writes WriteCoordinator, maxValueLength int) *Server {
 	return &Server{
-		addr:    addr,
-		store:   store,
-		cluster: cluster,
+		addr:           addr,
+		store:          store,
+		cluster:        cluster,
+		writes:         writes,
+		maxValueLength: maxValueLength,
 	}
 }
 
@@ -71,8 +90,7 @@ func (s *Server) setHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.cluster == nil || !s.cluster.WritesReady() {
-		http.Error(w, "writes are unavailable until Raft log replication is implemented", http.StatusServiceUnavailable)
+	if !s.requireLeaderForWrite(w, r) {
 		return
 	}
 
@@ -87,9 +105,18 @@ func (s *Server) setHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "key cannot be empty", http.StatusBadRequest)
 		return
 	}
+	if len(req.Value) > s.maxValueLength {
+		http.Error(w, fmt.Sprintf("value cannot be greater than %d", s.maxValueLength), http.StatusBadRequest)
+		return
+	}
 
-	// Phase 4.5 replaces this guard with a Raft proposal. A direct store write
-	// here would bypass majority replication and violate Raft safety.
+	ctx, cancel := context.WithTimeout(r.Context(), writeTimeout)
+	defer cancel()
+	if err := s.writes.ProposeSet(ctx, req.Key, req.Value); err != nil {
+		s.writeFailure(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) deleteHandler(w http.ResponseWriter, r *http.Request) {
@@ -97,12 +124,60 @@ func (s *Server) deleteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.cluster == nil || !s.cluster.WritesReady() {
-		http.Error(w, "writes are unavailable until Raft log replication is implemented", http.StatusServiceUnavailable)
+	if !s.requireLeaderForWrite(w, r) {
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, "missing query parameter: key", http.StatusBadRequest)
 		return
 	}
 
-	// Phase 4.5 replaces this guard with a Raft proposal.
+	ctx, cancel := context.WithTimeout(r.Context(), writeTimeout)
+	defer cancel()
+	if err := s.writes.ProposeDelete(ctx, key); err != nil {
+		s.writeFailure(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) requireLeaderForWrite(w http.ResponseWriter, r *http.Request) bool {
+	if s.writes == nil {
+		http.Error(w, "cluster writes are not configured", http.StatusServiceUnavailable)
+		return false
+	}
+	if s.writes.IsLeader() {
+		return true
+	}
+	s.redirectToLeader(w, r)
+	return false
+}
+
+func (s *Server) writeFailure(w http.ResponseWriter, r *http.Request, err error) {
+	// Leadership can change between requireLeaderForWrite and Propose. Re-read
+	// it before returning an error so the client gets the most useful next hop.
+	if !s.writes.IsLeader() {
+		s.redirectToLeader(w, r)
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "write was not confirmed by a Raft majority; retry", http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, "write was not confirmed: "+err.Error(), http.StatusServiceUnavailable)
+}
+
+func (s *Server) redirectToLeader(w http.ResponseWriter, r *http.Request) {
+	address, known := s.writes.LeaderHTTPAddr()
+	if !known {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "no Raft leader is known", http.StatusServiceUnavailable)
+		return
+	}
+	target := (&url.URL{Scheme: "http", Host: address, Path: r.URL.Path, RawQuery: r.URL.RawQuery}).String()
+	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 }
 
 func (s *Server) leaderHandler(w http.ResponseWriter, r *http.Request) {

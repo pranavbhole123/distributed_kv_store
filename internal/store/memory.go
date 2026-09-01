@@ -1,7 +1,6 @@
 package store
 
 import (
-	
 	"fmt"
 	"sync"
 )
@@ -10,22 +9,20 @@ import (
 
 type MemoryStore struct {
 	// we need one mutex and one map
-	mu   sync.RWMutex
-	data map[string]string
+	mu        sync.RWMutex
+	data      map[string]string
 	maxLength int
 }
 
-
-func NewMemoryStore(maxLength int)(*MemoryStore){
+func NewMemoryStore(maxLength int) *MemoryStore {
 	// made a constructor so that we can write extra logic here without changes at many places
-	
+
 	m := &MemoryStore{}
 	m.data = make(map[string]string)
 	m.maxLength = maxLength
 
 	return m
 }
-
 
 func (m *MemoryStore) Get(key string) (string, error) {
 	// lock the data with read
@@ -46,7 +43,7 @@ func (m *MemoryStore) Set(key string, val string) error {
 	if key == "" {
 		return fmt.Errorf("key cannot be empty")
 	}
-	if len(val)>m.maxLength{
+	if len(val) > m.maxLength {
 		return fmt.Errorf("value cannot be greater than %d", m.maxLength)
 	}
 
@@ -57,14 +54,9 @@ func (m *MemoryStore) Set(key string, val string) error {
 	return nil
 }
 
-
 func (m *MemoryStore) Delete(key string) error {
-    m.mu.Lock()
-    defer m.mu.Unlock()
-    _, ok := m.data[key]
-    if !ok {
-        return fmt.Errorf("key %q not found", key)
-    }
-    delete(m.data, key)
-    return nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data, key)
+	return nil
 }

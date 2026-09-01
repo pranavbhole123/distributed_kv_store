@@ -1,0 +1,302 @@
+Relevant question: if the HTTP request times out on an isolated leader, why is it unsafe for the client to blindly retry a non-idempotent future operation such as `INCREMENT balance` without a client request ID?
+
+imp question
+
+Yes, this is an **important distributed-systems problem**. The fundamental issue is:
+
+> **A timeout does not mean the operation failed. It means the client doesn't know whether it succeeded.**
+
+Suppose the client sends:
+
+```text id="ykp7ig"
+INCREMENT balance BY 100
+```
+
+Initial balance:
+
+```text id="n8kph7"
+balance = 500
+```
+
+### Case 1: definitely failed
+
+Client sends request to leader `A`, but `A` is isolated from the other nodes:
+
+```text id="mpd81c"
+        A (leader)
+        X
+       / \
+      B---C
+```
+
+A cannot replicate to a majority, so it cannot commit.
+
+Client waits:
+
+```text id="19q7wp"
+Client → A: INCREMENT +100
+             ↓
+          no majority
+             ↓
+Client ← TIMEOUT
+```
+
+In this particular case, retrying is fine because the operation never committed.
+
+But **the client doesn't actually know that** just from seeing `TIMEOUT`.
+
+That's the problem.
+
+### Case 2: operation succeeded, but response was lost
+
+Suppose:
+
+```text id="thmszd"
+Client
+   |
+   | INCREMENT +100
+   v
+Leader A
+   |
+   +----> B ✓
+   +----> C ✓
+```
+
+Majority replication succeeds:
+
+```text id="ebvzhm"
+commit ✓
+apply ✓
+
+balance:
+500 → 600
+```
+
+Now A tries to respond:
+
+```text id="qvzw5f"
+A → Client: SUCCESS
+```
+
+but the network drops the response.
+
+Client sees:
+
+```text id="vdnsfc"
+TIMEOUT
+```
+
+From the client's perspective, this looks exactly like Case 1.
+
+So the client thinks:
+
+> "Didn't get a response. I'll retry."
+
+It sends:
+
+```text id="gz8s4g"
+INCREMENT balance BY 100
+```
+
+again.
+
+Raft sees this as a **new command**:
+
+```text id="a3gbdo"
+index 50: INCREMENT +100
+index 51: INCREMENT +100
+```
+
+Both can commit.
+
+Result:
+
+```text id="sylljk"
+500
+ ↓ first request
+600
+ ↓ retry
+700    ❌
+```
+
+Client intended:
+
+```text id="q0k6ed"
+500 → 600
+```
+
+but got:
+
+```text id="kt3r5m"
+500 → 700
+```
+
+## Why doesn't Raft detect the duplicate?
+
+Because as far as Raft is concerned:
+
+```text id="shs9aq"
+INCREMENT +100
+INCREMENT +100
+```
+
+are two perfectly valid commands.
+
+Raft provides agreement about **which log entries execute and in what order**. It doesn't inherently know:
+
+> "These two HTTP requests represent the same logical client operation."
+
+You need to provide that information.
+
+That's where a **client request ID** comes in.
+
+Instead of:
+
+```text id="0i3usf"
+INCREMENT balance +100
+```
+
+client sends:
+
+```text id="jqfzyf"
+RequestID = abc123
+Command   = INCREMENT balance +100
+```
+
+First attempt:
+
+```text id="7ixr9u"
+index 50:
+    requestID = abc123
+    INCREMENT +100
+```
+
+It commits:
+
+```text id="jn6b0n"
+500 → 600
+```
+
+but response gets lost.
+
+Client retries **with the same request ID**:
+
+```text id="6f36iz"
+requestID = abc123
+INCREMENT +100
+```
+
+The state machine maintains something like:
+
+```text id="py7ycb"
+processedRequests:
+abc123 → Result{balance: 600}
+```
+
+When it sees `abc123` again:
+
+```text id="ctowfq"
+Have I processed abc123?
+
+YES
+ ↓
+DO NOT execute INCREMENT again
+ ↓
+return cached original result
+```
+
+Therefore:
+
+```text id="c9i7vm"
+first request:
+abc123 → +100 → balance 600
+
+retry:
+abc123 → already executed → balance remains 600
+```
+
+This gives you **deduplication**.
+
+### The deeper distributed-systems lesson
+
+Whenever you have:
+
+```text id="flc21h"
+Client → Server → perform operation → Server → Client
+```
+
+there is an unavoidable window:
+
+```text id="36rtze"
+operation succeeded
+        ↓
+      CRASH
+        ↓
+response never reaches client
+```
+
+The client cannot distinguish:
+
+```text id="uhtyqf"
+A: request never executed
+
+from
+
+B: request executed, response lost
+```
+
+Both appear as:
+
+```text id="xdk7yk"
+TIMEOUT
+```
+
+This is sometimes called an **ambiguous outcome**.
+
+That's why:
+
+```text id="0fbzz6"
+Timeout ≠ Failure
+```
+
+A timeout means:
+
+```text id="z2hsz6"
+"I don't know the outcome."
+```
+
+And this is also why idempotent operations are much easier to retry.
+
+For example:
+
+```text id="w5zjl5"
+SET balance = 600
+```
+
+retrying:
+
+```text id="51f94a"
+SET balance = 600
+SET balance = 600
+```
+
+still leaves:
+
+```text id="vjip38"
+balance = 600
+```
+
+But:
+
+```text id="4yl6gm"
+INCREMENT +100
+INCREMENT +100
+```
+
+doesn't.
+
+So the interview-level takeaway is:
+
+> **Clients cannot infer failure from a timeout. A request may have committed while its response was lost. Therefore blindly retrying non-idempotent operations can execute them multiple times. Attach a stable client/request ID to retries and have the replicated state machine deduplicate already-processed requests.**
+
+And crucially, the retry must use the **same request ID**. Generating a new ID for every HTTP retry defeats the entire mechanism.

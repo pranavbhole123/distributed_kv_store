@@ -46,3 +46,15 @@ The current memory store is rebuilt from committed history after a process
 restart, so recovery starts application from index zero even if a previous
 `lastApplied` value was persisted. The durable `lastApplied` checkpoint becomes
 authoritative once the project adds snapshots or a durable state machine.
+
+## HTTP writes enter through the leader
+
+HTTP handlers do not mutate `MemoryStore` directly. The current leader creates
+a Raft proposal and waits until its applied result; a follower returns a 307
+redirect to its known leader instead of becoming an internal forwarding proxy.
+This keeps client retries, request context, and final response ownership with
+the client and leader rather than adding another request/response protocol.
+
+The leader's wait is bounded. An isolated node that still believes it is leader
+cannot obtain a majority, so its HTTP request returns a retryable 503 rather
+than a false success.

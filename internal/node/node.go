@@ -60,7 +60,7 @@ func New(cfg config.Config, maxValueLength int) (*Node, error) {
 		logStore:  logStore,
 		transport: grpcTransport,
 	}
-	n.http = server.NewServer(cfg.Self.HTTPAddr, memoryStore, n)
+	n.http = server.NewServer(cfg.Self.HTTPAddr, memoryStore, n, n, maxValueLength)
 	closeLog = false
 	return n, nil
 }
@@ -137,9 +137,32 @@ func (n *Node) LeaderHTTPAddr() (string, bool) {
 	return peer.HTTPAddr, true
 }
 
-// WritesReady remains false until Phase 4, when Raft replication can commit a
-// command on a majority before the HTTP handler acknowledges the client.
-func (n *Node) WritesReady() bool { return false }
+// The following methods implement server.WriteCoordinator.
+func (n *Node) IsLeader() bool { return n.raft.IsLeader() }
+
+func (n *Node) ProposeSet(ctx context.Context, key, value string) error {
+	return n.propose(ctx, raft.Command{Operation: raft.SetOperation, Key: key, Value: value})
+}
+
+func (n *Node) ProposeDelete(ctx context.Context, key string) error {
+	return n.propose(ctx, raft.Command{Operation: raft.DeleteOperation, Key: key})
+}
+
+func (n *Node) propose(ctx context.Context, command raft.Command) error {
+	_, result, err := n.raft.Propose(command)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case applied, ok := <-result:
+		if !ok {
+			return errors.New("Raft proposal completed without a result")
+		}
+		return applied.Err
+	}
+}
 
 type storeApplier struct {
 	store store.Store
