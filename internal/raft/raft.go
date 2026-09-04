@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pranavbhole123/distributed_kv_store/internal/config"
+	"github.com/pranavbhole123/distributed_kv_store/internal/snapshot"
 )
 
 // State describes a node's role in the current Raft term.
@@ -91,6 +92,14 @@ type Applier interface {
 	Apply(LogEntry) error
 }
 
+// Snapshotter serializes and restores the complete state machine. Raft owns
+// the ordering and log boundary but deliberately does not know that the state
+// machine is currently an in-memory KV map.
+type Snapshotter interface {
+	Snapshot() ([]byte, error)
+	Restore([]byte) error
+}
+
 type Raft struct {
 	id        int
 	peers     []config.Node
@@ -139,6 +148,37 @@ func New(cfg config.Config, stable StableStore, transport Transport) (*Raft, err
 // deliberately invisible.
 func NewWithLog(cfg config.Config, stable StableStore, logStore LogStore, applier Applier, transport Transport) (*Raft, error) {
 	return newWithLogAndSnapshot(cfg, stable, logStore, applier, transport, SnapshotMetadata{})
+}
+
+// NewWithSnapshot restores the durable state-machine checkpoint before it
+// loads and replays the remaining committed Raft-log suffix. NewWithLog stays
+// available for election-only and pre-snapshot tests.
+func NewWithSnapshot(cfg config.Config, stable StableStore, logStore LogStore, applier Applier, snapshotter Snapshotter, snapshotStore snapshot.Store, transport Transport) (*Raft, error) {
+	if snapshotter == nil {
+		return nil, errors.New("Raft snapshotter cannot be nil")
+	}
+	if snapshotStore == nil {
+		return nil, errors.New("Raft snapshot store cannot be nil")
+	}
+
+	stored, found, err := snapshotStore.Load()
+	if err != nil {
+		return nil, fmt.Errorf("load Raft snapshot: %w", err)
+	}
+	metadata := SnapshotMetadata{}
+	if found {
+		metadata = SnapshotMetadata{
+			LastIncludedIndex: stored.LastIncludedIndex,
+			LastIncludedTerm:  stored.LastIncludedTerm,
+		}
+		if err := metadata.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid Raft snapshot metadata: %w", err)
+		}
+		if err := snapshotter.Restore(stored.Data); err != nil {
+			return nil, fmt.Errorf("restore Raft snapshot at index %d: %w", metadata.LastIncludedIndex, err)
+		}
+	}
+	return newWithLogAndSnapshot(cfg, stable, logStore, applier, transport, metadata)
 }
 
 // newWithLogAndSnapshot is the common constructor used by the future snapshot

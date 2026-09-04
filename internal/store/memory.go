@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 )
@@ -58,5 +59,41 @@ func (m *MemoryStore) Delete(key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.data, key)
+	return nil
+}
+
+// Snapshot serializes a consistent whole-map image while holding the read
+// lock. Raft treats these bytes as opaque state-machine data.
+func (m *MemoryStore) Snapshot() ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	data, err := json.Marshal(m.data)
+	if err != nil {
+		return nil, fmt.Errorf("encode memory store snapshot: %w", err)
+	}
+	return data, nil
+}
+
+// Restore replaces, rather than merges, the entire local read model. Decode
+// and validate before acquiring the write lock so a malformed snapshot cannot
+// leave a partially restored store behind.
+func (m *MemoryStore) Restore(data []byte) error {
+	decoded := make(map[string]string)
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("decode memory store snapshot: %w", err)
+	}
+	for key, value := range decoded {
+		if key == "" {
+			return fmt.Errorf("snapshot contains an empty key")
+		}
+		if len(value) > m.maxLength {
+			return fmt.Errorf("snapshot value for key %q exceeds maximum length %d", key, m.maxLength)
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data = decoded
 	return nil
 }

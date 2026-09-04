@@ -12,6 +12,7 @@ import (
 	"github.com/pranavbhole123/distributed_kv_store/internal/config"
 	"github.com/pranavbhole123/distributed_kv_store/internal/raft"
 	"github.com/pranavbhole123/distributed_kv_store/internal/server"
+	"github.com/pranavbhole123/distributed_kv_store/internal/snapshot"
 	"github.com/pranavbhole123/distributed_kv_store/internal/store"
 	"github.com/pranavbhole123/distributed_kv_store/internal/transport"
 	"google.golang.org/grpc"
@@ -46,9 +47,10 @@ func New(cfg config.Config, maxValueLength int) (*Node, error) {
 	}()
 
 	memoryStore := store.NewMemoryStore(maxValueLength)
+	snapshotStore := snapshot.NewFileStore(cfg.SnapshotPath())
 
 	grpcTransport := transport.NewGRPCTransport()
-	raftNode, err := raft.NewWithLog(cfg, raft.NewFileStableStore(cfg.RaftStatePath()), logStore, storeApplier{store: memoryStore}, grpcTransport)
+	raftNode, err := raft.NewWithSnapshot(cfg, raft.NewFileStableStore(cfg.RaftStatePath()), logStore, storeApplier{store: memoryStore}, memoryStore, snapshotStore, grpcTransport)
 	if err != nil {
 		_ = grpcTransport.Close()
 		return nil, err

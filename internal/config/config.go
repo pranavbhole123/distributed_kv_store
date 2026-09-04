@@ -62,6 +62,13 @@ func (c Config) RaftStatePath() string {
 	return filepath.Join(c.DataDir, "raft-state.json")
 }
 
+// SnapshotPath is the durable state-machine checkpoint for this node. It is
+// separate from the Raft log because a snapshot represents an applied prefix,
+// while the log retains the suffix that still needs Raft replication.
+func (c Config) SnapshotPath() string {
+	return filepath.Join(c.DataDir, "raft-snapshot.json")
+}
+
 func (c Config) Validate() error {
 	if c.ClusterSize() != 3 {
 		return fmt.Errorf("Phase 3 requires exactly 3 static cluster members, got %d", c.ClusterSize())

@@ -88,3 +88,16 @@ boundary and accesses retained entries through helpers such as `entryAt`,
 entry for `AppendEntries` prefix matching, even though its command has been
 discarded. This keeps voting, replication, commitment, recovery, and applying
 in terms of one stable absolute index space.
+
+## Snapshot publication and recovery order
+
+A snapshot is written to a temporary file, `fsync`ed, atomically renamed, and
+then its directory is `fsync`ed. The checksum covers both the Raft boundary
+metadata and the opaque state-machine bytes, so a damaged or mismatched
+snapshot is rejected before it can replace the in-memory state.
+
+At startup, a valid snapshot restores the state machine first. Raft then loads
+the durable suffix whose first possible entry is
+`LastIncludedIndex + 1` and replays only its committed entries. The retained
+suffix may include uncommitted entries, but those remain invisible exactly as
+they did before snapshots.

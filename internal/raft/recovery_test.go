@@ -1,12 +1,33 @@
 package raft
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
+
+	"github.com/pranavbhole123/distributed_kv_store/internal/snapshot"
+	"github.com/pranavbhole123/distributed_kv_store/internal/store"
 )
 
 type recordingApplier struct {
 	entries []LogEntry
+}
+
+type memoryStoreApplier struct {
+	store *store.MemoryStore
+}
+
+func (a memoryStoreApplier) Apply(entry LogEntry) error {
+	switch entry.Operation {
+	case NoopOperation:
+		return nil
+	case SetOperation:
+		return a.store.Set(entry.Key, entry.Value)
+	case DeleteOperation:
+		return a.store.Delete(entry.Key)
+	default:
+		return fmt.Errorf("unknown operation %q", entry.Operation)
+	}
 }
 
 func (a *recordingApplier) Apply(entry LogEntry) error {
@@ -88,5 +109,85 @@ func TestRestartReplaysOnlyCommittedPrefix(t *testing.T) {
 	}
 	if persisted.LastApplied != 1 {
 		t.Fatalf("persisted last_applied = %d, want 1", persisted.LastApplied)
+	}
+}
+
+func TestRestartRestoresSnapshotThenReplaysCommittedSuffix(t *testing.T) {
+	dir := t.TempDir()
+
+	beforeSnapshot := store.NewMemoryStore(20)
+	if err := beforeSnapshot.Set("from-snapshot", "kept"); err != nil {
+		t.Fatal(err)
+	}
+	if err := beforeSnapshot.Set("deleted-by-log", "old"); err != nil {
+		t.Fatal(err)
+	}
+	snapshotData, err := beforeSnapshot.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotStore := snapshot.NewFileStore(filepath.Join(dir, "raft-snapshot.json"))
+	if err := snapshotStore.Save(snapshot.Snapshot{
+		LastIncludedIndex: 500,
+		LastIncludedTerm:  7,
+		Data:              snapshotData,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stable := NewFileStableStore(filepath.Join(dir, "raft-state.json"))
+	if err := stable.Save(StableState{CurrentTerm: 8, VotedFor: NoVote, CommitIndex: 502, LastApplied: 500}); err != nil {
+		t.Fatal(err)
+	}
+	logStore, err := NewFileLogStore(filepath.Join(dir, "raft-log.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logStore.Close() })
+	if err := logStore.Append([]LogEntry{
+		{Index: 501, Term: 7, Operation: SetOperation, Key: "from-log", Value: "applied"},
+		{Index: 502, Term: 8, Operation: DeleteOperation, Key: "deleted-by-log"},
+		{Index: 503, Term: 8, Operation: SetOperation, Key: "uncommitted", Value: "hidden"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	recoveredStore := store.NewMemoryStore(20)
+	r, err := NewWithSnapshot(
+		testConfig(1, 3),
+		stable,
+		logStore,
+		memoryStoreApplier{store: recoveredStore},
+		recoveredStore,
+		snapshotStore,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata := r.SnapshotMetadata(); metadata.LastIncludedIndex != 500 || metadata.LastIncludedTerm != 7 {
+		t.Fatalf("snapshot metadata = %+v, want index/term 500/7", metadata)
+	}
+	if r.CommitIndex() != 502 || r.LastApplied() != 502 {
+		t.Fatalf("recovered commit/applied = %d/%d, want 502/502", r.CommitIndex(), r.LastApplied())
+	}
+	if value, err := recoveredStore.Get("from-snapshot"); err != nil || value != "kept" {
+		t.Fatalf("snapshot value = %q, %v; want kept, nil", value, err)
+	}
+	if value, err := recoveredStore.Get("from-log"); err != nil || value != "applied" {
+		t.Fatalf("committed suffix value = %q, %v; want applied, nil", value, err)
+	}
+	if _, err := recoveredStore.Get("deleted-by-log"); err == nil {
+		t.Fatal("committed DELETE suffix entry was not replayed")
+	}
+	if _, err := recoveredStore.Get("uncommitted"); err == nil {
+		t.Fatal("uncommitted suffix entry became visible during recovery")
+	}
+	persisted, err := stable.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.LastApplied != 502 {
+		t.Fatalf("persisted last applied = %d, want 502", persisted.LastApplied)
 	}
 }
