@@ -32,10 +32,24 @@ func (s *memoryLogStore) Append(entries []LogEntry) error {
 func (s *memoryLogStore) TruncateFrom(index uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if index == 0 || index > uint64(len(s.entries)+1) {
+	if index == 0 {
 		return fmt.Errorf("invalid truncate index %d", index)
 	}
-	s.entries = s.entries[:index-1]
+	if len(s.entries) == 0 {
+		return nil
+	}
+	lastIndex := s.entries[len(s.entries)-1].Index
+	if index > lastIndex+1 {
+		return fmt.Errorf("invalid truncate index %d after last index %d", index, lastIndex)
+	}
+	truncateOffset := len(s.entries)
+	for position, entry := range s.entries {
+		if entry.Index >= index {
+			truncateOffset = position
+			break
+		}
+	}
+	s.entries = s.entries[:truncateOffset]
 	return nil
 }
 

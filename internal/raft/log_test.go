@@ -72,3 +72,28 @@ func TestFileLogStoreDiscardsTornFinalRecord(t *testing.T) {
 		t.Fatalf("Load() after torn append = %+v, want [%+v]", entries, entry)
 	}
 }
+
+func TestFileLogStoreSupportsCompactedAbsoluteSuffix(t *testing.T) {
+	store, err := NewFileLogStore(filepath.Join(t.TempDir(), "raft-log.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	entries := []LogEntry{
+		{Index: 501, Term: 7, Operation: SetOperation, Key: "a", Value: "1"},
+		{Index: 502, Term: 8, Operation: SetOperation, Key: "b", Value: "2"},
+	}
+	if err := store.Append(entries); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.TruncateFrom(502); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != entries[0] {
+		t.Fatalf("compacted suffix after truncate = %+v, want %+v", got, entries[:1])
+	}
+}

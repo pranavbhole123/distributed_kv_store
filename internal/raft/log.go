@@ -19,6 +19,21 @@ const (
 	DeleteOperation Operation = "DELETE"
 )
 
+// SnapshotMetadata describes the compacted log prefix. The entry at
+// LastIncludedIndex is no longer in log; its term remains necessary for
+// AppendEntries matching and voting after compaction.
+type SnapshotMetadata struct {
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+}
+
+func (m SnapshotMetadata) Validate() error {
+	if m.LastIncludedIndex == 0 && m.LastIncludedTerm != 0 {
+		return fmt.Errorf("empty snapshot cannot have last included term %d", m.LastIncludedTerm)
+	}
+	return nil
+}
+
 // LogEntry is a command accepted by Raft. Index starts at 1; index 0 is the
 // implicit empty entry used by Raft's log-matching rules.
 type LogEntry struct {
@@ -113,8 +128,8 @@ func (s *FileLogStore) loadLocked() ([]LogEntry, error) {
 		if err := entry.Validate(); err != nil {
 			return nil, err
 		}
-		if entry.Index != uint64(position+1) {
-			return nil, fmt.Errorf("log entry index %d at record %d is not contiguous", entry.Index, position+1)
+		if position > 0 && entry.Index != entries[position-1].Index+1 {
+			return nil, fmt.Errorf("log entry index %d at record %d is not contiguous after index %d", entry.Index, position+1, entries[position-1].Index)
 		}
 		entries = append(entries, entry)
 	}
@@ -133,10 +148,20 @@ func (s *FileLogStore) TruncateFrom(index uint64) error {
 	if err != nil {
 		return err
 	}
-	if index > uint64(len(entries)+1) {
-		return fmt.Errorf("truncate index %d exceeds log length %d", index, len(entries))
+	truncateOffset := len(entries)
+	if len(entries) > 0 {
+		lastIndex := entries[len(entries)-1].Index
+		if index > lastIndex+1 {
+			return fmt.Errorf("truncate index %d exceeds last log index %d", index, lastIndex)
+		}
+		for position, entry := range entries {
+			if entry.Index >= index {
+				truncateOffset = position
+				break
+			}
+		}
 	}
-	return s.replaceLocked(entries[:index-1])
+	return s.replaceLocked(entries[:truncateOffset])
 }
 
 func (s *FileLogStore) replaceLocked(entries []LogEntry) error {
@@ -145,8 +170,8 @@ func (s *FileLogStore) replaceLocked(entries []LogEntry) error {
 		if err := entry.Validate(); err != nil {
 			return err
 		}
-		if entry.Index != uint64(position+1) {
-			return fmt.Errorf("replacement entry index %d at position %d is not contiguous", entry.Index, position+1)
+		if position > 0 && entry.Index != entries[position-1].Index+1 {
+			return fmt.Errorf("replacement entry index %d at position %d is not contiguous after index %d", entry.Index, position+1, entries[position-1].Index)
 		}
 		record, err := json.Marshal(entry)
 		if err != nil {

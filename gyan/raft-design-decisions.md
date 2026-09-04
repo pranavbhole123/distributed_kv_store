@@ -75,3 +75,16 @@ and in the reconstructed state-machine deduplication state, not merely in an
 HTTP-local map. The current API deliberately does not claim duplicate-request
 suppression; request IDs are deferred until that complete end-to-end contract
 is implemented.
+
+## Absolute log indexes survive compaction
+
+After a snapshot removes entries `1..N`, the in-memory and durable log hold
+only the suffix beginning at `N+1`. A slice offset is therefore no longer a
+Raft log index: `log[0]` might be entry `501`, not entry `1`.
+
+Raft records `LastIncludedIndex` and `LastIncludedTerm` as the compacted
+boundary and accesses retained entries through helpers such as `entryAt`,
+`termAt`, and `entriesFrom`. The boundary itself behaves like a remembered log
+entry for `AppendEntries` prefix matching, even though its command has been
+discarded. This keeps voting, replication, commitment, recovery, and applying
+in terms of one stable absolute index space.
