@@ -20,7 +20,7 @@ func TestCompactedSuffixUsesAbsoluteIndexesForReplication(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	r, err := newWithLogAndSnapshot(testConfig(1, 3), stable, logStore, nil, newLocalTransport(), meta)
+	r, err := newWithLogAndSnapshot(testConfig(1, 3), stable, logStore, nil, newLocalTransport(), meta, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestFollowerAppliesAbsoluteSuffixAfterSnapshotBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	applier := &orderedApplier{}
-	follower, err := newWithLogAndSnapshot(testConfig(2, 3), stable, logStore, applier, newLocalTransport(), meta)
+	follower, err := newWithLogAndSnapshot(testConfig(2, 3), stable, logStore, applier, newLocalTransport(), meta, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

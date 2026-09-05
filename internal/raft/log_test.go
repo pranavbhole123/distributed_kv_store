@@ -97,3 +97,29 @@ func TestFileLogStoreSupportsCompactedAbsoluteSuffix(t *testing.T) {
 		t.Fatalf("compacted suffix after truncate = %+v, want %+v", got, entries[:1])
 	}
 }
+
+func TestFileLogStoreCompactThroughKeepsOnlySuffix(t *testing.T) {
+	store, err := NewFileLogStore(filepath.Join(t.TempDir(), "raft-log.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	entries := []LogEntry{
+		{Index: 1, Term: 1, Operation: SetOperation, Key: "a", Value: "1"},
+		{Index: 2, Term: 1, Operation: SetOperation, Key: "b", Value: "2"},
+		{Index: 3, Term: 2, Operation: SetOperation, Key: "c", Value: "3"},
+	}
+	if err := store.Append(entries); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompactThrough(2); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != entries[2] {
+		t.Fatalf("compacted log = %+v, want [%+v]", got, entries[2])
+	}
+}

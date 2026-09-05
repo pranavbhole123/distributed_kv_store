@@ -101,12 +101,15 @@ type Snapshotter interface {
 }
 
 type Raft struct {
-	id        int
-	peers     []config.Node
-	transport Transport
-	stable    StableStore
-	logStore  LogStore
-	applier   Applier
+	id                int
+	peers             []config.Node
+	transport         Transport
+	stable            StableStore
+	logStore          LogStore
+	applier           Applier
+	snapshotter       Snapshotter
+	snapshotStore     snapshot.Store
+	snapshotThreshold uint64
 
 	electionTimeoutMin time.Duration
 	electionTimeoutMax time.Duration
@@ -130,6 +133,7 @@ type Raft struct {
 	replicating    map[int]bool
 	pendingResults map[uint64]chan Result // way to let the waiting http client know when the work is done
 	applyErr       error
+	snapshotErr    error
 
 	resetElection chan struct{}
 	replicateNow  chan struct{}
@@ -147,7 +151,7 @@ func New(cfg config.Config, stable StableStore, transport Transport) (*Raft, err
 // into applier at every process start. Uncommitted entries remain durable but
 // deliberately invisible.
 func NewWithLog(cfg config.Config, stable StableStore, logStore LogStore, applier Applier, transport Transport) (*Raft, error) {
-	return newWithLogAndSnapshot(cfg, stable, logStore, applier, transport, SnapshotMetadata{})
+	return newWithLogAndSnapshot(cfg, stable, logStore, applier, transport, SnapshotMetadata{}, nil, nil)
 }
 
 // NewWithSnapshot restores the durable state-machine checkpoint before it
@@ -174,17 +178,40 @@ func NewWithSnapshot(cfg config.Config, stable StableStore, logStore LogStore, a
 		if err := metadata.Validate(); err != nil {
 			return nil, fmt.Errorf("invalid Raft snapshot metadata: %w", err)
 		}
+		// Verify the independently durable state before using the snapshot to
+		// delete any log records. A checksum says the snapshot is internally
+		// intact; these checks establish that it belongs to this Raft history.
+		persisted, err := stable.Load()
+		if err != nil {
+			return nil, fmt.Errorf("load Raft stable state before snapshot recovery: %w", err)
+		}
+		if persisted.CommitIndex < metadata.LastIncludedIndex || persisted.LastApplied < metadata.LastIncludedIndex {
+			return nil, fmt.Errorf("snapshot index %d exceeds persisted commit/applied indexes %d/%d", metadata.LastIncludedIndex, persisted.CommitIndex, persisted.LastApplied)
+		}
+		entries, err := logStore.Load()
+		if err != nil {
+			return nil, fmt.Errorf("load Raft log before snapshot recovery: %w", err)
+		}
+		if err := validateSnapshotLogLayout(entries, metadata); err != nil {
+			return nil, fmt.Errorf("validate Raft log against snapshot: %w", err)
+		}
 		if err := snapshotter.Restore(stored.Data); err != nil {
 			return nil, fmt.Errorf("restore Raft snapshot at index %d: %w", metadata.LastIncludedIndex, err)
 		}
+		// A crash may have happened after the snapshot rename but before the
+		// old log prefix was compacted. The verified snapshot is authoritative,
+		// so discard that redundant prefix before validating the remaining log.
+		if err := logStore.CompactThrough(metadata.LastIncludedIndex); err != nil {
+			return nil, fmt.Errorf("compact redundant Raft log prefix through snapshot index %d: %w", metadata.LastIncludedIndex, err)
+		}
 	}
-	return newWithLogAndSnapshot(cfg, stable, logStore, applier, transport, metadata)
+	return newWithLogAndSnapshot(cfg, stable, logStore, applier, transport, metadata, snapshotter, snapshotStore)
 }
 
-// newWithLogAndSnapshot is the common constructor used by the future snapshot
-// loader. Phase 5.1 has no SnapshotStore yet, so public construction starts
-// with the implicit empty snapshot at index and term zero.
-func newWithLogAndSnapshot(cfg config.Config, stable StableStore, logStore LogStore, applier Applier, transport Transport, snapshotMeta SnapshotMetadata) (*Raft, error) {
+// newWithLogAndSnapshot is the common constructor behind normal and snapshot
+// recovery. A nil snapshotter/store deliberately disables automatic local
+// snapshots for lightweight election-only uses of NewWithLog.
+func newWithLogAndSnapshot(cfg config.Config, stable StableStore, logStore LogStore, applier Applier, transport Transport, snapshotMeta SnapshotMetadata, snapshotter Snapshotter, snapshotStore snapshot.Store) (*Raft, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid Raft configuration: %w", err)
 	}
@@ -196,6 +223,13 @@ func newWithLogAndSnapshot(cfg config.Config, stable StableStore, logStore LogSt
 	}
 	if err := snapshotMeta.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid Raft snapshot metadata: %w", err)
+	}
+	if (snapshotter == nil) != (snapshotStore == nil) {
+		return nil, errors.New("Raft snapshotter and snapshot store must be supplied together")
+	}
+	snapshotThreshold := cfg.SnapshotThreshold
+	if snapshotThreshold == 0 {
+		snapshotThreshold = config.DefaultSnapshotThreshold
 	}
 
 	persisted, err := stable.Load()
@@ -224,6 +258,9 @@ func newWithLogAndSnapshot(cfg config.Config, stable StableStore, logStore LogSt
 		stable:             stable,
 		logStore:           logStore,
 		applier:            applier,
+		snapshotter:        snapshotter,
+		snapshotStore:      snapshotStore,
+		snapshotThreshold:  snapshotThreshold,
 		electionTimeoutMin: cfg.ElectionTimeoutMin,
 		electionTimeoutMax: cfg.ElectionTimeoutMax,
 		heartbeatInterval:  cfg.HeartbeatInterval,
@@ -337,6 +374,15 @@ func (r *Raft) SnapshotMetadata() SnapshotMetadata {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.snapshotMeta
+}
+
+// SnapshotError reports the most recent local snapshot failure. A snapshot
+// failure leaves the durable log intact, so it does not make the state machine
+// unavailable; a later apply-cycle trigger retries safely.
+func (r *Raft) SnapshotError() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.snapshotErr
 }
 
 func (r *Raft) run(ctx context.Context) {
@@ -813,6 +859,30 @@ func validateLogSuffix(entries []LogEntry, snapshotMeta SnapshotMetadata) error 
 	return nil
 }
 
+// validateSnapshotLogLayout accepts either an already compacted suffix or a
+// redundant full prefix left by a crash after the snapshot rename. In the
+// latter case, the retained boundary entry must prove the snapshot's term.
+func validateSnapshotLogLayout(entries []LogEntry, snapshotMeta SnapshotMetadata) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	firstIndex := entries[0].Index
+	if firstIndex == snapshotMeta.LastIncludedIndex+1 {
+		return nil
+	}
+	if firstIndex > snapshotMeta.LastIncludedIndex+1 {
+		return fmt.Errorf("log starts at %d, leaving a gap after snapshot index %d", firstIndex, snapshotMeta.LastIncludedIndex)
+	}
+	boundaryOffset := snapshotMeta.LastIncludedIndex - firstIndex
+	if boundaryOffset >= uint64(len(entries)) || entries[boundaryOffset].Index != snapshotMeta.LastIncludedIndex {
+		return fmt.Errorf("log does not contain snapshot boundary index %d", snapshotMeta.LastIncludedIndex)
+	}
+	if entries[boundaryOffset].Term != snapshotMeta.LastIncludedTerm {
+		return fmt.Errorf("snapshot boundary term %d does not match log term %d at index %d", snapshotMeta.LastIncludedTerm, entries[boundaryOffset].Term, snapshotMeta.LastIncludedIndex)
+	}
+	return nil
+}
+
 func lastLogIndexFor(entries []LogEntry, snapshotMeta SnapshotMetadata) uint64 {
 	if len(entries) == 0 {
 		return snapshotMeta.LastIncludedIndex
@@ -979,6 +1049,11 @@ func (r *Raft) applyLoop(ctx context.Context) {
 				r.recordApplyFailure(err)
 				return
 			}
+			if err := r.maybeSnapshot(); err != nil {
+				r.recordSnapshotFailure(err)
+			} else {
+				r.clearSnapshotFailure()
+			}
 		}
 	}
 }
@@ -1042,6 +1117,81 @@ func (r *Raft) recordApplyFailure(err error) {
 		close(result)
 		delete(r.pendingResults, index)
 	}
+}
+
+// maybeSnapshot runs only on the single apply loop. Consequently no later
+// state-machine entry can be applied between selecting lastApplied and asking
+// Snapshotter for a complete image of that exact state.
+func (r *Raft) maybeSnapshot() error {
+	r.mu.RLock()
+	if r.snapshotter == nil || r.snapshotStore == nil || r.lastApplied-r.snapshotMeta.LastIncludedIndex < r.snapshotThreshold {
+		r.mu.RUnlock()
+		return nil
+	}
+	lastIncludedIndex := r.lastApplied
+	lastIncludedTerm, found := r.termAtLocked(lastIncludedIndex)
+	if !found {
+		r.mu.RUnlock()
+		return fmt.Errorf("snapshot boundary entry %d is absent", lastIncludedIndex)
+	}
+	snapshotter := r.snapshotter
+	snapshotStore := r.snapshotStore
+	r.mu.RUnlock()
+
+	data, err := snapshotter.Snapshot()
+	if err != nil {
+		return fmt.Errorf("serialize state-machine snapshot at index %d: %w", lastIncludedIndex, err)
+	}
+	if err := snapshotStore.Save(snapshot.Snapshot{
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
+		Data:              data,
+	}); err != nil {
+		return fmt.Errorf("persist snapshot at index %d: %w", lastIncludedIndex, err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// The apply loop itself cannot advance while it is taking the snapshot.
+	// Keep these checks so a future second applier or InstallSnapshot path
+	// cannot silently publish a mismatched boundary.
+	if r.lastApplied != lastIncludedIndex {
+		return fmt.Errorf("snapshot application advanced from index %d to %d", lastIncludedIndex, r.lastApplied)
+	}
+	if r.snapshotMeta.LastIncludedIndex >= lastIncludedIndex {
+		return nil
+	}
+	if r.commitIndex < lastIncludedIndex {
+		return fmt.Errorf("snapshot index %d exceeds commit index %d", lastIncludedIndex, r.commitIndex)
+	}
+	suffix, found := r.entriesFromLocked(lastIncludedIndex + 1)
+	if !found {
+		return fmt.Errorf("cannot retain Raft log suffix after snapshot index %d", lastIncludedIndex)
+	}
+	// If this fails, the newly saved snapshot and the existing full log are
+	// both durable. Recovery recognizes that safe redundant state and retries
+	// compaction before it validates the suffix.
+	if err := r.logStore.CompactThrough(lastIncludedIndex); err != nil {
+		return fmt.Errorf("compact Raft log through snapshot index %d: %w", lastIncludedIndex, err)
+	}
+	r.log = suffix
+	r.snapshotMeta = SnapshotMetadata{
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
+	}
+	return nil
+}
+
+func (r *Raft) recordSnapshotFailure(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.snapshotErr = err
+}
+
+func (r *Raft) clearSnapshotFailure() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.snapshotErr = nil
 }
 
 func (r *Raft) randomElectionTimeout() time.Duration {

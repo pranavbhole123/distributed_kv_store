@@ -65,13 +65,12 @@ func (t *localTransport) AppendEntries(ctx context.Context, peer config.Node, re
 
 func TestThreeNodesElectOneLeader(t *testing.T) {
 	nodes, _ := newTestCluster(t, 3)
-	leader := waitForLeader(t, nodes, time.Second)
-	waitForFollowerConvergence(t, nodes, leader.ID(), time.Second)
+	_ = waitForStableLeader(t, nodes, time.Second)
 }
 
 func TestRemainingNodesReplaceStoppedLeader(t *testing.T) {
 	nodes, transport := newTestCluster(t, 3)
-	oldLeader := waitForLeader(t, nodes, time.Second)
+	oldLeader := waitForStableLeader(t, nodes, time.Second)
 	oldLeader.Stop()
 	transport.unregister(oldLeader.ID())
 
@@ -81,7 +80,7 @@ func TestRemainingNodesReplaceStoppedLeader(t *testing.T) {
 			active = append(active, node)
 		}
 	}
-	newLeader := waitForLeader(t, active, time.Second)
+	newLeader := waitForStableLeader(t, active, time.Second)
 	if newLeader.ID() == oldLeader.ID() {
 		t.Fatalf("old leader %d was elected again", oldLeader.ID())
 	}
@@ -185,50 +184,4 @@ func testConfig(id, size int) config.Config {
 		ElectionTimeoutMax: 120 * time.Millisecond,
 		HeartbeatInterval:  15 * time.Millisecond,
 	}
-}
-
-func waitForLeader(t *testing.T, nodes []*Raft, timeout time.Duration) *Raft {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		var leader *Raft
-		leaders := 0
-		for _, node := range nodes {
-			if node.IsLeader() {
-				leader = node
-				leaders++
-			}
-		}
-		if leaders == 1 {
-			return leader
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("timed out waiting for exactly one leader")
-	return nil
-}
-
-func waitForFollowerConvergence(t *testing.T, nodes []*Raft, leaderID int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		converged := true
-		for _, node := range nodes {
-			if node.ID() == leaderID {
-				continue
-			}
-			if node.State() != Follower || node.LeaderID() != leaderID {
-				converged = false
-				break
-			}
-		}
-		if converged {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	for _, node := range nodes {
-		t.Logf("node %d state=%v leader=%d", node.ID(), node.State(), node.LeaderID())
-	}
-	t.Fatalf("followers did not converge on leader %d", leaderID)
 }

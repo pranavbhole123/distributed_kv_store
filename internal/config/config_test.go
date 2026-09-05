@@ -25,6 +25,7 @@ timing:
   election_timeout_min: 300ms
   election_timeout_max: 600ms
   heartbeat_interval: 50ms
+snapshot_threshold: 25
 `)
 	if err := os.WriteFile(path, contents, 0600); err != nil {
 		t.Fatal(err)
@@ -39,5 +40,8 @@ timing:
 	}
 	if peer, found := cfg.PeerByID(2); !found || peer.HTTPAddr != "localhost:8081" {
 		t.Fatalf("PeerByID(2) = %+v, %t; want peer 2", peer, found)
+	}
+	if cfg.SnapshotThreshold != 25 {
+		t.Fatalf("SnapshotThreshold = %d, want 25", cfg.SnapshotThreshold)
 	}
 }

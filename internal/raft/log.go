@@ -76,6 +76,9 @@ type LogStore interface {
 	Load() ([]LogEntry, error)
 	Append([]LogEntry) error
 	TruncateFrom(index uint64) error
+	// CompactThrough discards the already snapshotted prefix through index and
+	// atomically retains the remaining absolute-indexed suffix.
+	CompactThrough(index uint64) error
 	Close() error
 }
 
@@ -162,6 +165,26 @@ func (s *FileLogStore) TruncateFrom(index uint64) error {
 		}
 	}
 	return s.replaceLocked(entries[:truncateOffset])
+}
+
+// CompactThrough deletes every retained entry up to and including index. It is
+// intentionally Raft-specific: the generic WAL knows record positions, but
+// only this store understands an entry's absolute Raft index.
+func (s *FileLogStore) CompactThrough(index uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	firstRetained := len(entries)
+	for position, entry := range entries {
+		if entry.Index > index {
+			firstRetained = position
+			break
+		}
+	}
+	return s.replaceLocked(entries[firstRetained:])
 }
 
 func (s *FileLogStore) replaceLocked(entries []LogEntry) error {

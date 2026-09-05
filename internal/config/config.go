@@ -15,6 +15,7 @@ const (
 	DefaultElectionTimeoutMin = 300 * time.Millisecond
 	DefaultElectionTimeoutMax = 600 * time.Millisecond
 	DefaultHeartbeatInterval  = 50 * time.Millisecond
+	DefaultSnapshotThreshold  = uint64(1_000)
 )
 
 // Node identifies one member of the cluster. RaftAddr is reserved for the
@@ -35,6 +36,9 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
+	// SnapshotThreshold is the number of newly applied entries retained before
+	// Raft creates the next local snapshot. Zero selects the default.
+	SnapshotThreshold uint64
 }
 
 func (c Config) ClusterSize() int {
@@ -119,10 +123,11 @@ func (c Config) Validate() error {
 }
 
 type fileConfig struct {
-	Node    Node   `yaml:"node"`
-	Peers   []Node `yaml:"peers"`
-	DataDir string `yaml:"data_dir"`
-	Timing  timing `yaml:"timing"`
+	Node              Node   `yaml:"node"`
+	Peers             []Node `yaml:"peers"`
+	DataDir           string `yaml:"data_dir"`
+	Timing            timing `yaml:"timing"`
+	SnapshotThreshold uint64 `yaml:"snapshot_threshold"`
 }
 
 type timing struct {
@@ -152,6 +157,7 @@ func Load(path string) (Config, error) {
 		ElectionTimeoutMin: raw.Timing.ElectionTimeoutMin,
 		ElectionTimeoutMax: raw.Timing.ElectionTimeoutMax,
 		HeartbeatInterval:  raw.Timing.HeartbeatInterval,
+		SnapshotThreshold:  raw.SnapshotThreshold,
 	}
 	if cfg.ElectionTimeoutMin == 0 {
 		cfg.ElectionTimeoutMin = DefaultElectionTimeoutMin
@@ -161,6 +167,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.HeartbeatInterval == 0 {
 		cfg.HeartbeatInterval = DefaultHeartbeatInterval
+	}
+	if cfg.SnapshotThreshold == 0 {
+		cfg.SnapshotThreshold = DefaultSnapshotThreshold
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid configuration %q: %w", path, err)

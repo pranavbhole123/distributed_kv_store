@@ -53,4 +53,18 @@ func (s *memoryLogStore) TruncateFrom(index uint64) error {
 	return nil
 }
 
+func (s *memoryLogStore) CompactThrough(index uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	firstRetained := len(s.entries)
+	for position, entry := range s.entries {
+		if entry.Index > index {
+			firstRetained = position
+			break
+		}
+	}
+	s.entries = s.entries[firstRetained:]
+	return nil
+}
+
 func (s *memoryLogStore) Close() error { return nil }

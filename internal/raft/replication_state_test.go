@@ -10,26 +10,7 @@ import (
 
 func TestLeaderProposeReplicatesAndCommitsOnMajority(t *testing.T) {
 	nodes, _ := newTestCluster(t, 3)
-	leader := waitForLeader(t, nodes, time.Second)
-	waitForFollowerConvergence(t, nodes, leader.ID(), time.Second)
-
-	for _, node := range nodes {
-		if node.ID() == leader.ID() {
-			continue
-		}
-		if _, _, err := node.Propose(Command{Operation: SetOperation, Key: "x", Value: "1"}); !errors.Is(err, ErrNotLeader) {
-			t.Fatalf("follower %d Propose() error = %v, want ErrNotLeader", node.ID(), err)
-		}
-		break
-	}
-
-	index, result, err := leader.Propose(Command{Operation: SetOperation, Key: "x", Value: "1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if index != 2 {
-		t.Fatalf("proposal index = %d, want 2 after the leader's no-op", index)
-	}
+	leader, index, result := proposeOnStableLeader(t, nodes, Command{Operation: SetOperation, Key: "x", Value: "1"}, time.Second)
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -46,6 +27,64 @@ func TestLeaderProposeReplicatesAndCommitsOnMajority(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("proposal was not replicated, committed, and applied: leader commit=%d applied=%d followers with entry=%d", leader.CommitIndex(), leader.LastApplied(), followersWithEntry(nodes, leader.ID(), index))
+}
+
+// proposeOnStableLeader retries a valid leadership transition that happens
+// between observing a leader and acquiring Propose's mutex. A real client has
+// the same retry responsibility after ErrNotLeader.
+func proposeOnStableLeader(t *testing.T, nodes []*Raft, command Command, timeout time.Duration) (*Raft, uint64, <-chan Result) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		leader := currentStableLeader(nodes)
+		if leader == nil {
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		leader.mu.RLock()
+		lastIndex, _ := leader.lastLogInfoLocked()
+		leader.mu.RUnlock()
+
+		index, result, err := leader.Propose(command)
+		if errors.Is(err, ErrNotLeader) {
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index != lastIndex+1 {
+			t.Fatalf("proposal index = %d, want next index %d", index, lastIndex+1)
+		}
+		return leader, index, result
+	}
+	t.Fatal("timed out finding a stable leader that accepted the proposal")
+	return nil, 0, nil
+}
+
+func currentStableLeader(nodes []*Raft) *Raft {
+	var leader *Raft
+	for _, node := range nodes {
+		if node.IsLeader() {
+			if leader != nil {
+				return nil
+			}
+			leader = node
+		}
+	}
+	if leader == nil {
+		return nil
+	}
+	leaderID := leader.ID()
+	for _, node := range nodes {
+		if node.ID() != leaderID && (node.State() != Follower || node.LeaderID() != leaderID) {
+			return nil
+		}
+	}
+	if !leader.IsLeader() {
+		return nil
+	}
+	return leader
 }
 
 func TestReplicationBacktracksNextIndexAndRepairsFollower(t *testing.T) {
@@ -115,7 +154,7 @@ func followersWithEntry(nodes []*Raft, leaderID int, index uint64) int {
 			continue
 		}
 		node.mu.RLock()
-		hasEntry := uint64(len(node.log)) >= index
+		hasEntry := node.lastLogIndexLocked() >= index
 		node.mu.RUnlock()
 		if hasEntry {
 			followers++

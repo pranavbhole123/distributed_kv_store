@@ -13,6 +13,9 @@ peers:
 
 data_dir: data/node-3
 
+# Snapshot after this many entries have been applied since the last snapshot.
+snapshot_threshold: 1000
+
 timing:
   election_timeout_min: 300ms
   election_timeout_max: 600ms

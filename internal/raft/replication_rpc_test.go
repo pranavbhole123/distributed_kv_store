@@ -33,6 +33,18 @@ func (s *trackingLogStore) TruncateFrom(index uint64) error {
 	return nil
 }
 
+func (s *trackingLogStore) CompactThrough(index uint64) error {
+	firstRetained := len(s.entries)
+	for position, entry := range s.entries {
+		if entry.Index > index {
+			firstRetained = position
+			break
+		}
+	}
+	s.entries = s.entries[firstRetained:]
+	return nil
+}
+
 func (s *trackingLogStore) Close() error { return nil }
 
 func TestRequestVoteRejectsCandidateWithOlderLog(t *testing.T) {

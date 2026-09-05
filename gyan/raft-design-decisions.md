@@ -101,3 +101,16 @@ the durable suffix whose first possible entry is
 `LastIncludedIndex + 1` and replays only its committed entries. The retained
 suffix may include uncommitted entries, but those remain invisible exactly as
 they did before snapshots.
+
+## Snapshot creation is serialized with application
+
+The single Raft apply loop takes snapshots after it has drained currently
+committed entries. It snapshots `lastApplied`, never `commitIndex`, because
+only `lastApplied` is known to exist in the state-machine image.
+
+The order is: serialize that paused state-machine image, atomically publish the
+snapshot, compact the durable log through that same index, then advance the
+in-memory snapshot boundary. A failed snapshot save leaves the previous log
+authoritative. A crash after publication but before compaction leaves a valid
+snapshot plus a redundant full log; startup verifies the boundary and safely
+performs the deferred compaction before suffix replay.
