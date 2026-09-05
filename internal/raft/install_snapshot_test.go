@@ -216,3 +216,57 @@ func TestLeaderInstallsSnapshotThenReplicatesSuffix(t *testing.T) {
 	}
 	t.Fatalf("follower did not install and apply suffix: commit=%d applied=%d", follower.CommitIndex(), follower.LastApplied())
 }
+
+func TestCompactedLeaderUsesAppendEntriesForFollowerAtSnapshotBoundary(t *testing.T) {
+	meta := SnapshotMetadata{LastIncludedIndex: 2, LastIncludedTerm: 1}
+	leaderStable := NewFileStableStore(filepath.Join(t.TempDir(), "leader-state.json"))
+	if err := leaderStable.Save(StableState{CurrentTerm: 2, VotedFor: NoVote, CommitIndex: 3, LastApplied: 3}); err != nil {
+		t.Fatal(err)
+	}
+	leaderLog := newMemoryLogStore()
+	if err := leaderLog.Append([]LogEntry{{Index: 3, Term: 2, Operation: SetOperation, Key: "suffix", Value: "sent-by-append"}}); err != nil {
+		t.Fatal(err)
+	}
+	transport := newLocalTransport()
+	leader, err := newWithLogAndSnapshot(testConfig(1, 3), leaderStable, leaderLog, &recordingApplier{}, transport, meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	followerStable := NewFileStableStore(filepath.Join(t.TempDir(), "follower-state.json"))
+	if err := followerStable.Save(StableState{CurrentTerm: 2, VotedFor: NoVote, CommitIndex: 2, LastApplied: 2}); err != nil {
+		t.Fatal(err)
+	}
+	followerStore := store.NewMemoryStore(20)
+	follower, err := newWithLogAndSnapshot(testConfig(2, 3), followerStable, newMemoryLogStore(), memoryStoreApplier{store: followerStore}, transport, meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.register(follower)
+	follower.Start(context.Background())
+	t.Cleanup(follower.Stop)
+
+	leader.mu.Lock()
+	leader.state = Leader
+	leader.leaderID = leader.id
+	leader.nextIndex[follower.ID()] = 3
+	leader.matchIndex[follower.ID()] = 2
+	leader.mu.Unlock()
+
+	if _, sendSnapshot, err := leader.buildInstallSnapshot(follower.ID()); err != nil || sendSnapshot {
+		t.Fatalf("buildInstallSnapshot() = send=%t err=%v; follower already has snapshot boundary", sendSnapshot, err)
+	}
+	leader.replicateToPeer(context.Background(), follower.ID())
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if follower.LastApplied() == 3 {
+			if value, err := followerStore.Get("suffix"); err != nil || value != "sent-by-append" {
+				t.Fatalf("follower suffix state = %q, %v; want sent-by-append, nil", value, err)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("follower did not receive compacted leader suffix through AppendEntries: commit=%d applied=%d", follower.CommitIndex(), follower.LastApplied())
+}
