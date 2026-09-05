@@ -114,3 +114,23 @@ in-memory snapshot boundary. A failed snapshot save leaves the previous log
 authoritative. A crash after publication but before compaction leaves a valid
 snapshot plus a redundant full log; startup verifies the boundary and safely
 performs the deferred compaction before suffix replay.
+
+## Snapshot installation bridges a compacted leader to a lagging follower
+
+When a follower's `nextIndex` is at or before the leader's compacted snapshot
+boundary, decrementing `nextIndex` cannot help: the leader no longer owns the
+entries needed to prove an earlier prefix. It sends the complete durable
+snapshot instead.
+
+The follower first atomically saves the received snapshot. It retains a local
+suffix only when its entry at `LastIncludedIndex` has exactly the received
+`LastIncludedTerm`; otherwise that suffix is conflicting history and is
+discarded. It then restores the state machine and advances both commit and
+application checkpoints to the snapshot boundary. Snapshot restore, normal
+application, and local snapshot creation are serialized so they cannot create
+a mixed state-machine image.
+
+After a successful response, the leader records that the follower matches the
+snapshot boundary and resumes ordinary `AppendEntries` for any retained leader
+suffix. A whole snapshot is sent in one RPC for now; chunked transfer is a
+separate future concern for large snapshots.

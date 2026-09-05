@@ -71,6 +71,34 @@ func appendEntriesResponseFromProto(response *raftpb.AppendEntriesResponse) raft
 	return raft.AppendEntriesResponse{Term: response.GetTerm(), Success: response.GetSuccess()}
 }
 
+func installSnapshotToProto(request raft.InstallSnapshotRequest) *raftpb.InstallSnapshotRequest {
+	return &raftpb.InstallSnapshotRequest{
+		Term:              request.Term,
+		LeaderId:          int32(request.LeaderID),
+		LastIncludedIndex: request.LastIncludedIndex,
+		LastIncludedTerm:  request.LastIncludedTerm,
+		Data:              request.Data,
+	}
+}
+
+func installSnapshotFromProto(request *raftpb.InstallSnapshotRequest) raft.InstallSnapshotRequest {
+	return raft.InstallSnapshotRequest{
+		Term:              request.GetTerm(),
+		LeaderID:          int(request.GetLeaderId()),
+		LastIncludedIndex: request.GetLastIncludedIndex(),
+		LastIncludedTerm:  request.GetLastIncludedTerm(),
+		Data:              append([]byte(nil), request.GetData()...),
+	}
+}
+
+func installSnapshotResponseToProto(response raft.InstallSnapshotResponse) *raftpb.InstallSnapshotResponse {
+	return &raftpb.InstallSnapshotResponse{Term: response.Term}
+}
+
+func installSnapshotResponseFromProto(response *raftpb.InstallSnapshotResponse) raft.InstallSnapshotResponse {
+	return raft.InstallSnapshotResponse{Term: response.GetTerm()}
+}
+
 func logEntryToProto(entry raft.LogEntry) *raftpb.LogEntry {
 	return &raftpb.LogEntry{
 		Index:     entry.Index,

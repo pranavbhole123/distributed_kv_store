@@ -5,8 +5,9 @@ import (
 	"sync"
 )
 
-// memoryLogStore keeps existing election-only tests independent of disk. The
-// real node always injects FileLogStore.
+// memoryLogStore is a test-only, RAM-backed fake Raft log. It exists to keep
+// election and unit tests independent of disk; never use it in a production
+// node. Production Node.New always injects the durable FileLogStore instead.
 type memoryLogStore struct {
 	mu      sync.Mutex
 	entries []LogEntry

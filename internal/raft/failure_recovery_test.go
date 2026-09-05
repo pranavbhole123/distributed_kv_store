@@ -101,6 +101,19 @@ func (e networkEndpoint) AppendEntries(ctx context.Context, peer config.Node, re
 	}
 }
 
+func (e networkEndpoint) InstallSnapshot(ctx context.Context, peer config.Node, request InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	node, err := e.network.target(e.from, peer.ID)
+	if err != nil {
+		return InstallSnapshotResponse{}, err
+	}
+	select {
+	case <-ctx.Done():
+		return InstallSnapshotResponse{}, ctx.Err()
+	default:
+		return node.HandleInstallSnapshot(ctx, request)
+	}
+}
+
 func (n *partitionNetwork) target(from, to int) (*Raft, error) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()

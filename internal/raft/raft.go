@@ -56,6 +56,20 @@ type AppendEntriesResponse struct {
 	Success bool
 }
 
+// InstallSnapshot transports one complete, already checksummed state-machine
+// image when a follower is behind the leader's compacted log boundary.
+type InstallSnapshotRequest struct {
+	Term              uint64
+	LeaderID          int
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              []byte
+}
+
+type InstallSnapshotResponse struct {
+	Term uint64
+}
+
 // Command is a state-machine mutation proposed by a client. Raft assigns its
 // log index and term; callers must not choose either.
 type Command struct {
@@ -84,6 +98,7 @@ type Result struct {
 type Transport interface {
 	RequestVote(context.Context, config.Node, RequestVoteRequest) (RequestVoteResponse, error)
 	AppendEntries(context.Context, config.Node, AppendEntriesRequest) (AppendEntriesResponse, error)
+	InstallSnapshot(context.Context, config.Node, InstallSnapshotRequest) (InstallSnapshotResponse, error)
 }
 
 // Applier makes committed log entries visible in a state machine. Raft only
@@ -110,6 +125,10 @@ type Raft struct {
 	snapshotter       Snapshotter
 	snapshotStore     snapshot.Store
 	snapshotThreshold uint64
+	// snapshotMu serializes local snapshot creation with an incoming snapshot
+	// installation. stateMachineMu serializes Apply, Snapshot, and Restore.
+	snapshotMu     sync.Mutex
+	stateMachineMu sync.Mutex
 
 	electionTimeoutMin time.Duration
 	electionTimeoutMax time.Duration
@@ -178,31 +197,31 @@ func NewWithSnapshot(cfg config.Config, stable StableStore, logStore LogStore, a
 		if err := metadata.Validate(); err != nil {
 			return nil, fmt.Errorf("invalid Raft snapshot metadata: %w", err)
 		}
-		// Verify the independently durable state before using the snapshot to
-		// delete any log records. A checksum says the snapshot is internally
-		// intact; these checks establish that it belongs to this Raft history.
+		// A verified snapshot is authoritative. This also covers a crash during
+		// InstallSnapshot after its file rename but before stable/log metadata
+		// could be updated locally.
 		persisted, err := stable.Load()
 		if err != nil {
 			return nil, fmt.Errorf("load Raft stable state before snapshot recovery: %w", err)
-		}
-		if persisted.CommitIndex < metadata.LastIncludedIndex || persisted.LastApplied < metadata.LastIncludedIndex {
-			return nil, fmt.Errorf("snapshot index %d exceeds persisted commit/applied indexes %d/%d", metadata.LastIncludedIndex, persisted.CommitIndex, persisted.LastApplied)
 		}
 		entries, err := logStore.Load()
 		if err != nil {
 			return nil, fmt.Errorf("load Raft log before snapshot recovery: %w", err)
 		}
-		if err := validateSnapshotLogLayout(entries, metadata); err != nil {
-			return nil, fmt.Errorf("validate Raft log against snapshot: %w", err)
+		if err := recoverLogAfterSnapshot(logStore, entries, metadata); err != nil {
+			return nil, fmt.Errorf("recover Raft log against snapshot: %w", err)
 		}
 		if err := snapshotter.Restore(stored.Data); err != nil {
 			return nil, fmt.Errorf("restore Raft snapshot at index %d: %w", metadata.LastIncludedIndex, err)
 		}
-		// A crash may have happened after the snapshot rename but before the
-		// old log prefix was compacted. The verified snapshot is authoritative,
-		// so discard that redundant prefix before validating the remaining log.
-		if err := logStore.CompactThrough(metadata.LastIncludedIndex); err != nil {
-			return nil, fmt.Errorf("compact redundant Raft log prefix through snapshot index %d: %w", metadata.LastIncludedIndex, err)
+		if persisted.CommitIndex < metadata.LastIncludedIndex {
+			persisted.CommitIndex = metadata.LastIncludedIndex
+		}
+		if persisted.LastApplied < metadata.LastIncludedIndex {
+			persisted.LastApplied = metadata.LastIncludedIndex
+		}
+		if err := stable.Save(persisted); err != nil {
+			return nil, fmt.Errorf("persist recovered snapshot boundary: %w", err)
 		}
 	}
 	return newWithLogAndSnapshot(cfg, stable, logStore, applier, transport, metadata, snapshotter, snapshotStore)
@@ -545,6 +564,114 @@ func (r *Raft) HandleAppendEntries(_ context.Context, req AppendEntriesRequest) 
 	return AppendEntriesResponse{Term: r.currentTerm, Success: true}
 }
 
+// HandleInstallSnapshot replaces this follower's state-machine prefix with a
+// leader snapshot. It reports failures as RPC errors because the wire response
+// has no Success flag: a leader must not advance nextIndex on a failed install.
+func (r *Raft) HandleInstallSnapshot(_ context.Context, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	r.snapshotMu.Lock()
+	defer r.snapshotMu.Unlock()
+
+	r.mu.Lock()
+	response := InstallSnapshotResponse{Term: r.currentTerm}
+	if req.Term < r.currentTerm {
+		r.mu.Unlock()
+		return response, nil
+	}
+	if req.Term > r.currentTerm {
+		if err := r.becomeFollowerLocked(req.Term, req.LeaderID); err != nil {
+			r.mu.Unlock()
+			return response, fmt.Errorf("persist higher term from InstallSnapshot: %w", err)
+		}
+	} else {
+		r.state = Follower
+		r.leaderID = req.LeaderID
+	}
+	response.Term = r.currentTerm
+	if r.snapshotter == nil || r.snapshotStore == nil {
+		r.mu.Unlock()
+		return response, errors.New("Raft node cannot install a snapshot without snapshot storage")
+	}
+	metadata := SnapshotMetadata{LastIncludedIndex: req.LastIncludedIndex, LastIncludedTerm: req.LastIncludedTerm}
+	if err := metadata.Validate(); err != nil {
+		r.mu.Unlock()
+		return response, fmt.Errorf("invalid InstallSnapshot metadata: %w", err)
+	}
+	if len(req.Data) == 0 {
+		r.mu.Unlock()
+		return response, errors.New("InstallSnapshot data cannot be empty")
+	}
+	// A follower that has already applied this index has state at least as new
+	// as the requested snapshot. Raft can safely ignore this duplicate/older
+	// transfer while still recognizing the valid leader.
+	if req.LastIncludedIndex <= r.lastApplied {
+		r.mu.Unlock()
+		r.signalElectionReset()
+		return response, nil
+	}
+
+	retainSuffix := false
+	var suffix []LogEntry
+	if localTerm, found := r.termAtLocked(req.LastIncludedIndex); found && localTerm == req.LastIncludedTerm {
+		if retained, found := r.entriesFromLocked(req.LastIncludedIndex + 1); found {
+			suffix = retained
+			retainSuffix = true
+		}
+	}
+
+	// Save first. If the process crashes after this point, startup treats the
+	// verified snapshot as authoritative and finishes any deferred log cleanup.
+	if err := r.snapshotStore.Save(snapshot.Snapshot{
+		LastIncludedIndex: req.LastIncludedIndex,
+		LastIncludedTerm:  req.LastIncludedTerm,
+		Data:              req.Data,
+	}); err != nil {
+		r.mu.Unlock()
+		return response, fmt.Errorf("persist installed snapshot at index %d: %w", req.LastIncludedIndex, err)
+	}
+	if retainSuffix {
+		if err := r.logStore.CompactThrough(req.LastIncludedIndex); err != nil {
+			r.mu.Unlock()
+			return response, fmt.Errorf("compact retained log prefix through snapshot index %d: %w", req.LastIncludedIndex, err)
+		}
+	} else if len(r.log) > 0 {
+		// A mismatched boundary proves this is a conflicting suffix. No command
+		// in it may survive, including entries after the snapshot boundary.
+		if err := r.logStore.TruncateFrom(r.firstLogIndexLocked()); err != nil {
+			r.mu.Unlock()
+			return response, fmt.Errorf("discard conflicting log suffix for snapshot index %d: %w", req.LastIncludedIndex, err)
+		}
+	}
+
+	// applyCommitted releases r.mu before Apply, so share an explicit mutex
+	// with it. Keeping r.mu here prevents AppendEntries from changing the log
+	// while the durable install is being finalized.
+	r.stateMachineMu.Lock()
+	err := r.snapshotter.Restore(req.Data)
+	r.stateMachineMu.Unlock()
+	if err != nil {
+		r.mu.Unlock()
+		return response, fmt.Errorf("restore installed snapshot at index %d: %w", req.LastIncludedIndex, err)
+	}
+	newCommitIndex := max(r.commitIndex, req.LastIncludedIndex)
+	newLastApplied := max(r.lastApplied, req.LastIncludedIndex)
+	if err := r.saveStableValuesLocked(r.currentTerm, r.votedFor, newCommitIndex, newLastApplied); err != nil {
+		r.mu.Unlock()
+		return response, fmt.Errorf("persist installed snapshot metadata: %w", err)
+	}
+	r.log = suffix
+	r.snapshotMeta = metadata
+	r.commitIndex = newCommitIndex
+	r.lastApplied = newLastApplied
+	needsApply := r.commitIndex > r.lastApplied
+	r.mu.Unlock()
+
+	r.signalElectionReset()
+	if needsApply {
+		r.signalApply()
+	}
+	return response, nil
+}
+
 func (r *Raft) startElection(parent context.Context) {
 	r.mu.Lock()
 	term, err := r.becomeCandidateLocked()
@@ -643,6 +770,20 @@ func (r *Raft) replicateToPeer(parent context.Context, peerID int) {
 	ctx, cancel := context.WithTimeout(parent, r.electionTimeoutMin/2)
 	defer cancel()
 	for {
+		snapshotRequest, sendSnapshot, err := r.buildInstallSnapshot(peerID)
+		if err != nil {
+			return
+		}
+		if sendSnapshot {
+			response, err := r.transport.InstallSnapshot(ctx, peer, snapshotRequest)
+			if err != nil {
+				return
+			}
+			if !r.handleInstallSnapshotResponse(peerID, snapshotRequest, response) {
+				return
+			}
+			continue
+		}
 		request, ok := r.buildAppendEntries(peerID)
 		if !ok {
 			return
@@ -660,6 +801,53 @@ func (r *Raft) replicateToPeer(parent context.Context, peerID int) {
 		default:
 		}
 	}
+}
+
+// buildInstallSnapshot loads a durable local snapshot only when this follower
+// has fallen behind the prefix the leader compacted away. Disk I/O happens
+// outside r.mu; the second lock check prevents an older snapshot being sent
+// after a role, term, or boundary change.
+func (r *Raft) buildInstallSnapshot(peerID int) (InstallSnapshotRequest, bool, error) {
+	r.mu.RLock()
+	if r.state != Leader {
+		r.mu.RUnlock()
+		return InstallSnapshotRequest{}, false, nil
+	}
+	next, knownPeer := r.nextIndex[peerID]
+	metadata := r.snapshotMeta
+	term := r.currentTerm
+	store := r.snapshotStore
+	needsSnapshot := knownPeer && next <= metadata.LastIncludedIndex
+	r.mu.RUnlock()
+	if !needsSnapshot {
+		return InstallSnapshotRequest{}, false, nil
+	}
+	if store == nil {
+		return InstallSnapshotRequest{}, false, errors.New("leader needs a snapshot but has no snapshot store")
+	}
+	stored, found, err := store.Load()
+	if err != nil {
+		return InstallSnapshotRequest{}, false, fmt.Errorf("load snapshot for follower %d: %w", peerID, err)
+	}
+	if !found {
+		return InstallSnapshotRequest{}, false, fmt.Errorf("leader needs a snapshot for follower %d but none is durable", peerID)
+	}
+	if stored.LastIncludedIndex != metadata.LastIncludedIndex || stored.LastIncludedTerm != metadata.LastIncludedTerm {
+		return InstallSnapshotRequest{}, false, fmt.Errorf("durable snapshot boundary %d/%d differs from Raft boundary %d/%d", stored.LastIncludedIndex, stored.LastIncludedTerm, metadata.LastIncludedIndex, metadata.LastIncludedTerm)
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.state != Leader || r.currentTerm != term || r.snapshotMeta != metadata || r.nextIndex[peerID] > metadata.LastIncludedIndex {
+		return InstallSnapshotRequest{}, false, nil
+	}
+	return InstallSnapshotRequest{
+		Term:              term,
+		LeaderID:          r.id,
+		LastIncludedIndex: metadata.LastIncludedIndex,
+		LastIncludedTerm:  metadata.LastIncludedTerm,
+		Data:              stored.Data,
+	}, true, nil
 }
 
 // buildAppendEntries snapshots the precise prefix and suffix for one peer.
@@ -728,6 +916,25 @@ func (r *Raft) handleAppendEntriesResponse(peerID int, request AppendEntriesRequ
 		r.signalReplication()
 	}
 	return false
+}
+
+// handleInstallSnapshotResponse records that the follower now owns the
+// compacted prefix. The next replication iteration uses normal AppendEntries
+// to send any suffix still after the snapshot boundary.
+func (r *Raft) handleInstallSnapshotResponse(peerID int, request InstallSnapshotRequest, response InstallSnapshotResponse) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if response.Term > r.currentTerm {
+		_ = r.becomeFollowerLocked(response.Term, UnknownLeader)
+		return false
+	}
+	if r.state != Leader || request.Term != r.currentTerm || response.Term != r.currentTerm {
+		return false
+	}
+	r.matchIndex[peerID] = request.LastIncludedIndex
+	r.nextIndex[peerID] = request.LastIncludedIndex + 1
+	return true
 }
 
 // advanceCommitIndexLocked commits the greatest current-term entry known to be
@@ -859,10 +1066,11 @@ func validateLogSuffix(entries []LogEntry, snapshotMeta SnapshotMetadata) error 
 	return nil
 }
 
-// validateSnapshotLogLayout accepts either an already compacted suffix or a
-// redundant full prefix left by a crash after the snapshot rename. In the
-// latter case, the retained boundary entry must prove the snapshot's term.
-func validateSnapshotLogLayout(entries []LogEntry, snapshotMeta SnapshotMetadata) error {
+// recoverLogAfterSnapshot reconciles a verified snapshot with the local log.
+// A matching boundary retains its suffix. A mismatched or incomplete boundary
+// is conflicting follower history and is discarded; the snapshot is the newer
+// authoritative state in that crash window.
+func recoverLogAfterSnapshot(logStore LogStore, entries []LogEntry, snapshotMeta SnapshotMetadata) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -874,13 +1082,10 @@ func validateSnapshotLogLayout(entries []LogEntry, snapshotMeta SnapshotMetadata
 		return fmt.Errorf("log starts at %d, leaving a gap after snapshot index %d", firstIndex, snapshotMeta.LastIncludedIndex)
 	}
 	boundaryOffset := snapshotMeta.LastIncludedIndex - firstIndex
-	if boundaryOffset >= uint64(len(entries)) || entries[boundaryOffset].Index != snapshotMeta.LastIncludedIndex {
-		return fmt.Errorf("log does not contain snapshot boundary index %d", snapshotMeta.LastIncludedIndex)
+	if boundaryOffset < uint64(len(entries)) && entries[boundaryOffset].Index == snapshotMeta.LastIncludedIndex && entries[boundaryOffset].Term == snapshotMeta.LastIncludedTerm {
+		return logStore.CompactThrough(snapshotMeta.LastIncludedIndex)
 	}
-	if entries[boundaryOffset].Term != snapshotMeta.LastIncludedTerm {
-		return fmt.Errorf("snapshot boundary term %d does not match log term %d at index %d", snapshotMeta.LastIncludedTerm, entries[boundaryOffset].Term, snapshotMeta.LastIncludedIndex)
-	}
-	return nil
+	return logStore.TruncateFrom(firstIndex)
 }
 
 func lastLogIndexFor(entries []LogEntry, snapshotMeta SnapshotMetadata) uint64 {
@@ -1078,9 +1283,12 @@ func (r *Raft) applyCommitted() error {
 		r.mu.RUnlock()
 
 		if entry.Operation != NoopOperation {
+			r.stateMachineMu.Lock()
 			if err := applier.Apply(entry); err != nil {
+				r.stateMachineMu.Unlock()
 				return fmt.Errorf("apply committed log entry %d: %w", entry.Index, err)
 			}
+			r.stateMachineMu.Unlock()
 		}
 
 		r.mu.Lock()
@@ -1123,6 +1331,9 @@ func (r *Raft) recordApplyFailure(err error) {
 // state-machine entry can be applied between selecting lastApplied and asking
 // Snapshotter for a complete image of that exact state.
 func (r *Raft) maybeSnapshot() error {
+	r.snapshotMu.Lock()
+	defer r.snapshotMu.Unlock()
+
 	r.mu.RLock()
 	if r.snapshotter == nil || r.snapshotStore == nil || r.lastApplied-r.snapshotMeta.LastIncludedIndex < r.snapshotThreshold {
 		r.mu.RUnlock()
@@ -1138,7 +1349,9 @@ func (r *Raft) maybeSnapshot() error {
 	snapshotStore := r.snapshotStore
 	r.mu.RUnlock()
 
+	r.stateMachineMu.Lock()
 	data, err := snapshotter.Snapshot()
+	r.stateMachineMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("serialize state-machine snapshot at index %d: %w", lastIncludedIndex, err)
 	}

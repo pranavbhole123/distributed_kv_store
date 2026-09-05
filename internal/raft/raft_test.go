@@ -63,6 +63,21 @@ func (t *localTransport) AppendEntries(ctx context.Context, peer config.Node, re
 	}
 }
 
+func (t *localTransport) InstallSnapshot(ctx context.Context, peer config.Node, request InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	t.mu.RLock()
+	node := t.nodes[peer.ID]
+	t.mu.RUnlock()
+	if node == nil {
+		return InstallSnapshotResponse{}, errors.New("peer unavailable")
+	}
+	select {
+	case <-ctx.Done():
+		return InstallSnapshotResponse{}, ctx.Err()
+	default:
+		return node.HandleInstallSnapshot(ctx, request)
+	}
+}
+
 func TestThreeNodesElectOneLeader(t *testing.T) {
 	nodes, _ := newTestCluster(t, 3)
 	_ = waitForStableLeader(t, nodes, time.Second)

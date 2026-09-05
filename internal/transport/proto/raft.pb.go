@@ -24,6 +24,8 @@ const (
 type Operation int32
 
 const (
+	// The zero value represents Raft's internal leader no-op. Clients cannot
+	// create it; Raft uses it to commit inherited prior-term entries safely.
 	Operation_OPERATION_UNSPECIFIED Operation = 0
 	Operation_OPERATION_SET         Operation = 1
 	Operation_OPERATION_DELETE      Operation = 2
@@ -326,6 +328,126 @@ func (x *AppendEntriesResponse) GetSuccess() bool {
 	return false
 }
 
+type InstallSnapshotRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Term              uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId          int32                  `protobuf:"varint,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	LastIncludedIndex uint64                 `protobuf:"varint,3,opt,name=last_included_index,json=lastIncludedIndex,proto3" json:"last_included_index,omitempty"`
+	LastIncludedTerm  uint64                 `protobuf:"varint,4,opt,name=last_included_term,json=lastIncludedTerm,proto3" json:"last_included_term,omitempty"`
+	Data              []byte                 `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *InstallSnapshotRequest) Reset() {
+	*x = InstallSnapshotRequest{}
+	mi := &file_internal_transport_proto_raft_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallSnapshotRequest) ProtoMessage() {}
+
+func (x *InstallSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_transport_proto_raft_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*InstallSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_internal_transport_proto_raft_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *InstallSnapshotRequest) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetLeaderId() int32 {
+	if x != nil {
+		return x.LeaderId
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetLastIncludedIndex() uint64 {
+	if x != nil {
+		return x.LastIncludedIndex
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetLastIncludedTerm() uint64 {
+	if x != nil {
+		return x.LastIncludedTerm
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+type InstallSnapshotResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstallSnapshotResponse) Reset() {
+	*x = InstallSnapshotResponse{}
+	mi := &file_internal_transport_proto_raft_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallSnapshotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallSnapshotResponse) ProtoMessage() {}
+
+func (x *InstallSnapshotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_transport_proto_raft_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallSnapshotResponse.ProtoReflect.Descriptor instead.
+func (*InstallSnapshotResponse) Descriptor() ([]byte, []int) {
+	return file_internal_transport_proto_raft_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *InstallSnapshotResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
 type LogEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Index         uint64                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
@@ -339,7 +461,7 @@ type LogEntry struct {
 
 func (x *LogEntry) Reset() {
 	*x = LogEntry{}
-	mi := &file_internal_transport_proto_raft_proto_msgTypes[4]
+	mi := &file_internal_transport_proto_raft_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -351,7 +473,7 @@ func (x *LogEntry) String() string {
 func (*LogEntry) ProtoMessage() {}
 
 func (x *LogEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_transport_proto_raft_proto_msgTypes[4]
+	mi := &file_internal_transport_proto_raft_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -364,7 +486,7 @@ func (x *LogEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogEntry.ProtoReflect.Descriptor instead.
 func (*LogEntry) Descriptor() ([]byte, []int) {
-	return file_internal_transport_proto_raft_proto_rawDescGZIP(), []int{4}
+	return file_internal_transport_proto_raft_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *LogEntry) GetIndex() uint64 {
@@ -424,7 +546,15 @@ const file_internal_transport_proto_raft_proto_rawDesc = "" +
 	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"E\n" +
 	"\x15AppendEntriesResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"\x9c\x01\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xbb\x01\n" +
+	"\x16InstallSnapshotRequest\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x02 \x01(\x05R\bleaderId\x12.\n" +
+	"\x13last_included_index\x18\x03 \x01(\x04R\x11lastIncludedIndex\x12,\n" +
+	"\x12last_included_term\x18\x04 \x01(\x04R\x10lastIncludedTerm\x12\x12\n" +
+	"\x04data\x18\x05 \x01(\fR\x04data\"-\n" +
+	"\x17InstallSnapshotResponse\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\"\x9c\x01\n" +
 	"\bLogEntry\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\x04R\x05index\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x04R\x04term\x12>\n" +
@@ -434,10 +564,11 @@ const file_internal_transport_proto_raft_proto_rawDesc = "" +
 	"\tOperation\x12\x19\n" +
 	"\x15OPERATION_UNSPECIFIED\x10\x00\x12\x11\n" +
 	"\rOPERATION_SET\x10\x01\x12\x14\n" +
-	"\x10OPERATION_DELETE\x10\x022\xdf\x01\n" +
+	"\x10OPERATION_DELETE\x10\x022\xd1\x02\n" +
 	"\vRaftService\x12d\n" +
 	"\vRequestVote\x12).distributedkv.raft.v1.RequestVoteRequest\x1a*.distributedkv.raft.v1.RequestVoteResponse\x12j\n" +
-	"\rAppendEntries\x12+.distributedkv.raft.v1.AppendEntriesRequest\x1a,.distributedkv.raft.v1.AppendEntriesResponseBPZNgithub.com/pranavbhole123/distributed_kv_store/internal/transport/proto;raftpbb\x06proto3"
+	"\rAppendEntries\x12+.distributedkv.raft.v1.AppendEntriesRequest\x1a,.distributedkv.raft.v1.AppendEntriesResponse\x12p\n" +
+	"\x0fInstallSnapshot\x12-.distributedkv.raft.v1.InstallSnapshotRequest\x1a..distributedkv.raft.v1.InstallSnapshotResponseBPZNgithub.com/pranavbhole123/distributed_kv_store/internal/transport/proto;raftpbb\x06proto3"
 
 var (
 	file_internal_transport_proto_raft_proto_rawDescOnce sync.Once
@@ -452,24 +583,28 @@ func file_internal_transport_proto_raft_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_transport_proto_raft_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_internal_transport_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_internal_transport_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_internal_transport_proto_raft_proto_goTypes = []any{
-	(Operation)(0),                // 0: distributedkv.raft.v1.Operation
-	(*RequestVoteRequest)(nil),    // 1: distributedkv.raft.v1.RequestVoteRequest
-	(*RequestVoteResponse)(nil),   // 2: distributedkv.raft.v1.RequestVoteResponse
-	(*AppendEntriesRequest)(nil),  // 3: distributedkv.raft.v1.AppendEntriesRequest
-	(*AppendEntriesResponse)(nil), // 4: distributedkv.raft.v1.AppendEntriesResponse
-	(*LogEntry)(nil),              // 5: distributedkv.raft.v1.LogEntry
+	(Operation)(0),                  // 0: distributedkv.raft.v1.Operation
+	(*RequestVoteRequest)(nil),      // 1: distributedkv.raft.v1.RequestVoteRequest
+	(*RequestVoteResponse)(nil),     // 2: distributedkv.raft.v1.RequestVoteResponse
+	(*AppendEntriesRequest)(nil),    // 3: distributedkv.raft.v1.AppendEntriesRequest
+	(*AppendEntriesResponse)(nil),   // 4: distributedkv.raft.v1.AppendEntriesResponse
+	(*InstallSnapshotRequest)(nil),  // 5: distributedkv.raft.v1.InstallSnapshotRequest
+	(*InstallSnapshotResponse)(nil), // 6: distributedkv.raft.v1.InstallSnapshotResponse
+	(*LogEntry)(nil),                // 7: distributedkv.raft.v1.LogEntry
 }
 var file_internal_transport_proto_raft_proto_depIdxs = []int32{
-	5, // 0: distributedkv.raft.v1.AppendEntriesRequest.entries:type_name -> distributedkv.raft.v1.LogEntry
+	7, // 0: distributedkv.raft.v1.AppendEntriesRequest.entries:type_name -> distributedkv.raft.v1.LogEntry
 	0, // 1: distributedkv.raft.v1.LogEntry.operation:type_name -> distributedkv.raft.v1.Operation
 	1, // 2: distributedkv.raft.v1.RaftService.RequestVote:input_type -> distributedkv.raft.v1.RequestVoteRequest
 	3, // 3: distributedkv.raft.v1.RaftService.AppendEntries:input_type -> distributedkv.raft.v1.AppendEntriesRequest
-	2, // 4: distributedkv.raft.v1.RaftService.RequestVote:output_type -> distributedkv.raft.v1.RequestVoteResponse
-	4, // 5: distributedkv.raft.v1.RaftService.AppendEntries:output_type -> distributedkv.raft.v1.AppendEntriesResponse
-	4, // [4:6] is the sub-list for method output_type
-	2, // [2:4] is the sub-list for method input_type
+	5, // 4: distributedkv.raft.v1.RaftService.InstallSnapshot:input_type -> distributedkv.raft.v1.InstallSnapshotRequest
+	2, // 5: distributedkv.raft.v1.RaftService.RequestVote:output_type -> distributedkv.raft.v1.RequestVoteResponse
+	4, // 6: distributedkv.raft.v1.RaftService.AppendEntries:output_type -> distributedkv.raft.v1.AppendEntriesResponse
+	6, // 7: distributedkv.raft.v1.RaftService.InstallSnapshot:output_type -> distributedkv.raft.v1.InstallSnapshotResponse
+	5, // [5:8] is the sub-list for method output_type
+	2, // [2:5] is the sub-list for method input_type
 	2, // [2:2] is the sub-list for extension type_name
 	2, // [2:2] is the sub-list for extension extendee
 	0, // [0:2] is the sub-list for field type_name
@@ -486,7 +621,7 @@ func file_internal_transport_proto_raft_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_transport_proto_raft_proto_rawDesc), len(file_internal_transport_proto_raft_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   5,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

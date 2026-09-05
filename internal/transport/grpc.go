@@ -53,6 +53,18 @@ func (t *GRPCTransport) AppendEntries(ctx context.Context, peer config.Node, req
 	return appendEntriesResponseFromProto(response), nil
 }
 
+func (t *GRPCTransport) InstallSnapshot(ctx context.Context, peer config.Node, request raft.InstallSnapshotRequest) (raft.InstallSnapshotResponse, error) {
+	client, err := t.client(peer.RaftAddr)
+	if err != nil {
+		return raft.InstallSnapshotResponse{}, err
+	}
+	response, err := client.InstallSnapshot(ctx, installSnapshotToProto(request))
+	if err != nil {
+		return raft.InstallSnapshotResponse{}, fmt.Errorf("InstallSnapshot to node %d at %s: %w", peer.ID, peer.RaftAddr, err)
+	}
+	return installSnapshotResponseFromProto(response), nil
+}
+
 func (t *GRPCTransport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -120,6 +132,14 @@ func (s *RaftRPCServer) RequestVote(ctx context.Context, request *raftpb.Request
 func (s *RaftRPCServer) AppendEntries(ctx context.Context, request *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
 	response := s.raft.HandleAppendEntries(ctx, appendEntriesFromProto(request))
 	return appendEntriesResponseToProto(response), nil
+}
+
+func (s *RaftRPCServer) InstallSnapshot(ctx context.Context, request *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	response, err := s.raft.HandleInstallSnapshot(ctx, installSnapshotFromProto(request))
+	if err != nil {
+		return nil, err
+	}
+	return installSnapshotResponseToProto(response), nil
 }
 
 func RegisterRaftRPCServer(server *grpc.Server, node *raft.Raft) {

@@ -9,11 +9,20 @@ import (
 
 	"github.com/pranavbhole123/distributed_kv_store/internal/config"
 	"github.com/pranavbhole123/distributed_kv_store/internal/raft"
+	"github.com/pranavbhole123/distributed_kv_store/internal/snapshot"
+	"github.com/pranavbhole123/distributed_kv_store/internal/store"
 	"google.golang.org/grpc"
 )
 
 func TestGRPCTransportDeliversRaftRPCs(t *testing.T) {
-	target, err := raft.New(config.Config{
+	targetDir := t.TempDir()
+	targetLog, err := raft.NewFileLogStore(filepath.Join(targetDir, "raft-log.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = targetLog.Close() })
+	targetStore := store.NewMemoryStore(20)
+	target, err := raft.NewWithSnapshot(config.Config{
 		Self: config.Node{ID: 2, RaftAddr: "unused", HTTPAddr: "unused"},
 		Peers: []config.Node{
 			{ID: 1, RaftAddr: "unused-peer-1", HTTPAddr: "unused-peer-1"},
@@ -24,7 +33,7 @@ func TestGRPCTransportDeliversRaftRPCs(t *testing.T) {
 		ElectionTimeoutMin: 300 * time.Millisecond,
 		ElectionTimeoutMax: 600 * time.Millisecond,
 		HeartbeatInterval:  50 * time.Millisecond,
-	}, raft.NewFileStableStore(filepath.Join(t.TempDir(), "raft-state.json")), nil)
+	}, raft.NewFileStableStore(filepath.Join(targetDir, "raft-state.json")), targetLog, nil, targetStore, snapshot.NewFileStore(filepath.Join(targetDir, "snapshot.json")), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +71,34 @@ func TestGRPCTransportDeliversRaftRPCs(t *testing.T) {
 	if !heartbeat.Success || target.LeaderID() != 1 {
 		t.Fatalf("AppendEntries() = %+v, target leader = %d; want successful heartbeat from leader 1", heartbeat, target.LeaderID())
 	}
+
+	sourceStore := store.NewMemoryStore(20)
+	if err := sourceStore.Set("from-snapshot", "value"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := sourceStore.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := transport.InstallSnapshot(ctx, peer, raft.InstallSnapshotRequest{
+		Term:              2,
+		LeaderID:          1,
+		LastIncludedIndex: 1,
+		LastIncludedTerm:  1,
+		Data:              data,
+	})
+	if err != nil {
+		t.Fatalf("InstallSnapshot() error = %v", err)
+	}
+	if installed.Term != 2 {
+		t.Fatalf("InstallSnapshot() response = %+v, want term 2", installed)
+	}
+	if metadata := target.SnapshotMetadata(); metadata.LastIncludedIndex != 1 || metadata.LastIncludedTerm != 1 {
+		t.Fatalf("target snapshot metadata = %+v, want 1/1", metadata)
+	}
+	if value, err := targetStore.Get("from-snapshot"); err != nil || value != "value" {
+		t.Fatalf("target restored snapshot value = %q, %v; want value, nil", value, err)
+	}
 }
 
 func TestNoopLogEntryRoundTripsThroughProto(t *testing.T) {
@@ -75,6 +112,24 @@ func TestNoopLogEntryRoundTripsThroughProto(t *testing.T) {
 	roundTripped := appendEntriesFromProto(appendEntriesToProto(request))
 	if len(roundTripped.Entries) != 1 || roundTripped.Entries[0] != request.Entries[0] {
 		t.Fatalf("round-tripped entries = %+v, want %+v", roundTripped.Entries, request.Entries)
+	}
+}
+
+func TestInstallSnapshotRoundTripsThroughProto(t *testing.T) {
+	request := raft.InstallSnapshotRequest{
+		Term:              4,
+		LeaderID:          1,
+		LastIncludedIndex: 50,
+		LastIncludedTerm:  3,
+		Data:              []byte(`{"key":"value"}`),
+	}
+	roundTripped := installSnapshotFromProto(installSnapshotToProto(request))
+	if roundTripped.Term != request.Term ||
+		roundTripped.LeaderID != request.LeaderID ||
+		roundTripped.LastIncludedIndex != request.LastIncludedIndex ||
+		roundTripped.LastIncludedTerm != request.LastIncludedTerm ||
+		string(roundTripped.Data) != string(request.Data) {
+		t.Fatalf("round-tripped snapshot = %+v, want %+v", roundTripped, request)
 	}
 }
 
