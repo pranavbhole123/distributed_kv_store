@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Live dashboard for a three-node Raft KV-store demo." />
+    <title>Raft KV — Cluster Console</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">DISTRIBUTED SYSTEMS DEMO</p>
+          <h1>Raft KV <span>Cluster Console</span></h1>
+        </div>
+        <div class="connection" id="connection-status" aria-live="polite">
+          <span class="pulse"></span>
+          <span>Connecting to cluster</span>
+        </div>
+      </header>
+
+      <section class="summary" aria-label="Cluster summary">
+        <article>
+          <p>Observed leader</p>
+          <strong id="leader-summary">—</strong>
+        </article>
+        <article>
+          <p>Observed term</p>
+          <strong id="term-summary">—</strong>
+        </article>
+        <article>
+          <p>Write quorum</p>
+          <strong>2 / 3</strong>
+        </article>
+        <article>
+          <p>Read model</p>
+          <strong>Local / stale allowed</strong>
+        </article>
+      </section>
+
+      <section class="section-heading">
+        <div>
+          <p class="eyebrow">LIVE MEMBERSHIP</p>
+          <h2>Three static voting nodes</h2>
+        </div>
+        <p id="last-updated" aria-live="polite">Waiting for first poll…</p>
+      </section>
+
+      <section class="node-grid" id="node-grid" aria-live="polite"></section>
+
+      <section class="workspace">
+        <article class="panel mutation-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">QUORUM WRITE</p>
+              <h2>Mutate through the leader</h2>
+            </div>
+            <span class="status-pill" id="write-target">Discovering leader</span>
+          </div>
+
+          <form id="set-form" class="command-form">
+            <label>
+              Key
+              <input id="set-key" name="key" value="demo-key" maxlength="100" required />
+            </label>
+            <label>
+              Value
+              <input id="set-value" name="value" value="hello raft" maxlength="3000" required />
+            </label>
+            <button type="submit" class="primary">SET → replicate → commit</button>
+          </form>
+
+          <div class="delete-row">
+            <span>Delete the same key through the observed leader.</span>
+            <button type="button" id="delete-button" class="secondary">DELETE key</button>
+          </div>
+          <p class="operation-result" id="write-result" aria-live="polite">No write submitted yet.</p>
+        </article>
+
+        <article class="panel read-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">LOCAL READS</p>
+              <h2>Compare each replica</h2>
+            </div>
+            <span class="status-pill muted">Eventual consistency</span>
+          </div>
+          <form id="read-form" class="read-form">
+            <label for="read-key">Key</label>
+            <input id="read-key" value="demo-key" maxlength="100" required />
+            <button type="submit" class="secondary">Read all nodes</button>
+          </form>
+          <div class="read-results" id="read-results" aria-live="polite">
+            <p>Submit a read to compare local state on all three nodes.</p>
+          </div>
+        </article>
+      </section>
+
+      <section class="lower-grid">
+        <article class="panel guide-panel">
+          <p class="eyebrow">INTERVIEW FLOW</p>
+          <h2>Show failure without faking it</h2>
+          <ol>
+            <li>Write a value and compare all local reads.</li>
+            <li>Stop the current leader in a terminal.</li>
+            <li>Watch a new term and leader appear here.</li>
+            <li>Write again, restart the stopped node, and observe recovery.</li>
+          </ol>
+          <code>docker compose -f compose.demo.yaml stop node-2</code>
+          <p class="fine-print">This dashboard never controls containers itself. Keep operational control in your terminal, not exposed through a public web page.</p>
+        </article>
+
+        <article class="panel event-panel">
+          <p class="eyebrow">CLIENT EVENT LOG</p>
+          <h2>What the dashboard observed</h2>
+          <ol class="events" id="events" aria-live="polite">
+            <li>Waiting for the first cluster observation.</li>
+          </ol>
+        </article>
+      </section>
+    </main>
+    <!-- Bump this asset version whenever dashboard routing or state handling
+         changes. It prevents a browser from keeping an obsolete client after
+         the Compose stack is recreated. -->
+    <script src="/app.js?v=demo-3"></script>
+  </body>
+</html>

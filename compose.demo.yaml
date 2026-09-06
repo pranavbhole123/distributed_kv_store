@@ -1,0 +1,89 @@
+services:
+  node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/etc/kv/node-1.yaml"]
+    volumes:
+      - ./deploy/configs/node-1.yaml:/etc/kv/node-1.yaml:ro
+      - node_1_data:/var/lib/kv
+    networks: [raft]
+    restart: unless-stopped
+    healthcheck:
+      # HTTP binds to the advertised Docker hostname, not loopback. Keeping the
+      # same address for listening and leader redirects is sufficient for this
+      # demo deployment.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://node-1:8080/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 6
+      start_period: 5s
+
+  node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/etc/kv/node-2.yaml"]
+    volumes:
+      - ./deploy/configs/node-2.yaml:/etc/kv/node-2.yaml:ro
+      - node_2_data:/var/lib/kv
+    networks: [raft]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://node-2:8080/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 6
+      start_period: 5s
+
+  node-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/etc/kv/node-3.yaml"]
+    volumes:
+      - ./deploy/configs/node-3.yaml:/etc/kv/node-3.yaml:ro
+      - node_3_data:/var/lib/kv
+    networks: [raft]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://node-3:8080/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 6
+      start_period: 5s
+
+  dashboard:
+    image: caddy:2-alpine
+    depends_on:
+      node-1:
+        condition: service_healthy
+      node-2:
+        condition: service_healthy
+      node-3:
+        condition: service_healthy
+    environment:
+      # Set DEMO_DOMAIN to the DNS name pointed at the host. Caddy then obtains
+      # and renews HTTPS automatically. The :80 default is plain local HTTP.
+      DEMO_DOMAIN: ${DEMO_DOMAIN:-:80}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./demo:/srv:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [raft]
+    restart: unless-stopped
+
+networks:
+  raft:
+    driver: bridge
+
+volumes:
+  node_1_data:
+  node_2_data:
+  node_3_data:
+  caddy_data:
+  caddy_config:

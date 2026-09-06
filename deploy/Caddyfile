@@ -1,0 +1,35 @@
+# The Compose default (:80) serves plain HTTP locally. Set DEMO_DOMAIN to a
+# real DNS name for Caddy-managed HTTPS on ports 80 and 443.
+{$DEMO_DOMAIN} {
+	encode zstd gzip
+
+	# route preserves this order. Without it, Caddy sorts try_files ahead of the
+	# API handlers, rewrites /api/node-N/... to /index.html, and the dashboard
+	# receives its own HTML instead of the nodes' JSON.
+	route {
+		# The dashboard is operational UI, not a versioned production asset
+		# bundle. Always revalidate it so a tab cannot keep an old API client
+		# after a local Compose redeploy.
+		@dashboard_assets path / /index.html /app.js /styles.css
+		header @dashboard_assets Cache-Control "no-store"
+
+		# Keep each node's HTTP API behind one public origin. The dashboard can
+		# poll all nodes without CORS, while Raft's gRPC ports stay private.
+		handle_path /api/node-1/* {
+			reverse_proxy node-1:8080
+		}
+		handle_path /api/node-2/* {
+			reverse_proxy node-2:8080
+		}
+		handle_path /api/node-3/* {
+			reverse_proxy node-3:8080
+		}
+
+		# This is the final fallback for dashboard assets and client-side paths.
+		handle {
+			root * /srv
+			try_files {path} /index.html
+			file_server
+		}
+	}
+}

@@ -1,0 +1,17 @@
+node:
+  id: 2
+  raft_addr: node-2:9090
+  http_addr: node-2:8080
+peers:
+  - id: 1
+    raft_addr: node-1:9090
+    http_addr: node-1:8080
+  - id: 3
+    raft_addr: node-3:9090
+    http_addr: node-3:8080
+data_dir: /var/lib/kv
+snapshot_threshold: 10
+timing:
+  election_timeout_min: 300ms
+  election_timeout_max: 600ms
+  heartbeat_interval: 50ms
